@@ -119,19 +119,24 @@ def save_state():
         print(f"[WARN] save_state failed: {e}")
 
 def load_state():
-    global admin_ids, talk_map, FORWARD_PUBLIC_CHAT_ID, FORWARD_STAFFTALK_CHAT_ID
+    global admin_ids, talk_map, FORWARD_PUBLIC_CHAT_ID, FORWARD_STAFFTALK_CHAT_ID, EVENT_REG_FORM
     try:
         p = Path(STATE_FILE)
         if not p.exists():
             return
+
         with p.open("r", encoding="utf-8") as f:
             data = json.load(f)
+
+        # bersihkan & isi ulang admin_ids
         admin_ids.clear()
         for x in data.get("admin_ids", []):
             try:
                 admin_ids.add(int(x))
             except Exception:
                 pass
+
+        # bersihkan & isi ulang talk_map
         talk_map.clear()
         for k, uid in data.get("talk_map", {}).items():
             try:
@@ -139,30 +144,37 @@ def load_state():
                 talk_map[(chat_id, msg_id)] = int(uid)
             except Exception:
                 pass
-        # gunakan nilai tersimpan bila ada
+
+        # forward chat id
         try:
             fp = int(data.get("forward_public_chat_id"))
             if fp:
-                globals()["FORWARD_PUBLIC_CHAT_ID"] = fp
+                FORWARD_PUBLIC_CHAT_ID = fp
         except Exception:
             pass
+
         try:
             fs = int(data.get("forward_stafftalk_chat_id"))
             if fs:
-                globals()["FORWARD_STAFFTALK_CHAT_ID"] = fs
+                FORWARD_STAFFTALK_CHAT_ID = fs
         except Exception:
             pass
+
+        # reg_open_flags
         if isinstance(data.get("reg_open_flags"), dict):
-            # jaga kunci yang dikenal saja
             for k in REG_OPEN_FLAGS.keys():
                 v = data["reg_open_flags"].get(k)
                 if isinstance(v, bool):
                     REG_OPEN_FLAGS[k] = v
+
+        # event_reg_form
         ev = data.get("event_reg_form")
         if isinstance(ev, str) and ev.strip():
             EVENT_REG_FORM = ev
+
     except Exception as e:
         print(f"[WARN] load_state failed: {e}")
+
 
 # ----- Raport (aktivitas & dungeon points) -----
 def save_raport():
