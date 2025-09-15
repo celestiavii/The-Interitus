@@ -1,0 +1,2566 @@
+import json
+import os
+import re
+import random
+from datetime import datetime
+from pathlib import Path
+from io import BytesIO
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import MessageEntityType
+from telegram.error import Forbidden
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, filters, ContextTypes, ConversationHandler
+)
+
+# ========= KONFIGURASI DASAR =========
+BOT_TOKEN = "8437252604:AAFnjB_edcec6EpfLLV3scQEAqVQDjjp57c"
+OWNER_USERNAME = "deittee"
+
+if not BOT_TOKEN:
+    raise RuntimeError("Missing BOT_TOKEN environment variable")
+
+FORWARD_PUBLIC_CHAT_ID = int(os.getenv("FIERTE_FORWARD_PUBLIC", "-1002544338902"))
+FORWARD_STAFFTALK_CHAT_ID = int(os.getenv("FIERTE_FORWARD_STAFFTALK", "-1002932959625"))
+
+ERYNDALE_URL = "https://deivern.carrd.co"
+BASE_DIR = Path(__file__).parent.resolve()
+
+# ========= IN-MEMORY =========
+ACCOUNTS = {}
+ACCOUNT_INDEX = {}
+FREED_NUMBERS = []
+PROFESSORS = set()
+
+user_rolls = {}
+user_stats = {}
+admin_ids = set()
+talk_map = {}
+
+RAPORT_FILE = os.getenv("FIERTE_RAPORT", "fierte_raport.json")
+RAPORT = {}
+
+TITLES_FILE = os.getenv("FIERTE_TITLES", "fierte_titles.json")
+TITLES = {}
+
+# ----- Registration toggles + Event form -----
+# default semua terbuka
+REG_OPEN_FLAGS = {
+    "calon_pelajar": True,
+    "pengurus": True,
+    "media_partner": True,
+    "sponsorship": True,
+    "event": True,
+}
+# format pendaftaran event yang bisa di-set admin
+EVENT_REG_FORM = (
+    "⌜Pendaftaran Event⌟\n"
+    "▸ Nama Lengkap :\n"
+    "▸ Username :\n"
+    "▸ Kontak :\n"
+    "▸ Data Tambahan :\n"
+    "(Catatan: format ini bisa diubah admin dengan /seteventform)"
+)
+
+
+# ---------- STATE & STORAGE ----------
+STATE_FILE = os.getenv("FIERTE_STATE", "fierte_state.json")
+ACCOUNTS_FILE = os.getenv("FIERTE_ACCOUNTS", "fierte_accounts.json")
+
+def save_accounts():
+    try:
+        data = {
+            "accounts": ACCOUNTS,
+            "index": ACCOUNT_INDEX,
+            "freed": FREED_NUMBERS,
+            "professors": list(PROFESSORS),
+        }
+        with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[WARN] save_accounts failed: {e}")
+
+def load_accounts():
+    global ACCOUNTS, ACCOUNT_INDEX, FREED_NUMBERS, PROFESSORS
+    try:
+        p = Path(ACCOUNTS_FILE)
+        if not p.exists():
+            return
+        with p.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        ACCOUNTS = data.get("accounts", {})
+        ACCOUNT_INDEX = data.get("index", {})
+        FREED_NUMBERS = data.get("freed", [])
+        PROFESSORS = set(data.get("professors", []))
+    except Exception as e:
+        print(f"[WARN] load_accounts failed: {e}")
+
+def _tm_key(chat_id: int, message_id: int) -> str:
+    return f"{chat_id}:{message_id}"
+
+def _tm_parse(key: str) -> tuple[int, int]:
+    c, m = key.split(":", 1)
+    return int(c), int(m)
+
+def save_state():
+    try:
+        data = {
+            "admin_ids": list(admin_ids),
+            "talk_map": { _tm_key(c, m): int(uid) for (c, m), uid in talk_map.items() },
+            "forward_public_chat_id": FORWARD_PUBLIC_CHAT_ID,
+            "forward_stafftalk_chat_id": FORWARD_STAFFTALK_CHAT_ID,
+            "reg_open_flags": REG_OPEN_FLAGS,
+            "event_reg_form": EVENT_REG_FORM,
+        }
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[WARN] save_state failed: {e}")
+
+def load_state():
+    global admin_ids, talk_map, FORWARD_PUBLIC_CHAT_ID, FORWARD_STAFFTALK_CHAT_ID
+    try:
+        p = Path(STATE_FILE)
+        if not p.exists():
+            return
+        with p.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        admin_ids.clear()
+        for x in data.get("admin_ids", []):
+            try:
+                admin_ids.add(int(x))
+            except Exception:
+                pass
+        talk_map.clear()
+        for k, uid in data.get("talk_map", {}).items():
+            try:
+                chat_id, msg_id = _tm_parse(k)
+                talk_map[(chat_id, msg_id)] = int(uid)
+            except Exception:
+                pass
+        # gunakan nilai tersimpan bila ada
+        try:
+            fp = int(data.get("forward_public_chat_id"))
+            if fp:
+                globals()["FORWARD_PUBLIC_CHAT_ID"] = fp
+        except Exception:
+            pass
+        try:
+            fs = int(data.get("forward_stafftalk_chat_id"))
+            if fs:
+                globals()["FORWARD_STAFFTALK_CHAT_ID"] = fs
+        except Exception:
+            pass
+        if isinstance(data.get("reg_open_flags"), dict):
+            # jaga kunci yang dikenal saja
+            for k in REG_OPEN_FLAGS.keys():
+                v = data["reg_open_flags"].get(k)
+                if isinstance(v, bool):
+                    REG_OPEN_FLAGS[k] = v
+        ev = data.get("event_reg_form")
+        if isinstance(ev, str) and ev.strip():
+            EVENT_REG_FORM = ev
+    except Exception as e:
+        print(f"[WARN] load_state failed: {e}")
+
+# ----- Raport (aktivitas & dungeon points) -----
+def save_raport():
+    try:
+        with open(RAPORT_FILE, "w", encoding="utf-8") as f:
+            json.dump({"raport": RAPORT}, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[WARN] save_raport failed: {e}")
+
+def load_raport():
+    global RAPORT
+    try:
+        p = Path(RAPORT_FILE)
+        if not p.exists():
+            return
+        with p.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        RAPORT = data.get("raport", {})
+    except Exception as e:
+        print(f"[WARN] load_raport failed: {e}")
+
+def _ensure_student_record(uid: int) -> dict:
+    rec = RAPORT.setdefault(str(uid), {})
+    rec.setdefault("active_scores", [])
+    rec.setdefault("active_score", 0.0)
+    rec.setdefault("dungeon_points", 0.0)
+    return rec
+
+def _raport_add_active(uid: int, score: int):
+    rec = _ensure_student_record(uid)
+    s = max(0, min(100, int(score)))
+    rec["active_scores"].append(s)
+    scores = rec["active_scores"]
+    rec["active_score"] = sum(scores) / len(scores) if scores else 0.0
+
+def _raport_grant_dungeon(uid: int):
+    rec = _ensure_student_record(uid)
+    # maksimum 10; kalau sudah >=10, biarkan
+    if float(rec.get("dungeon_points", 0.0)) < 10.0:
+        rec["dungeon_points"] = 10.0
+
+# ----- Titles registry (opsional load/save) -----
+def save_titles():
+    try:
+        with open(TITLES_FILE, "w", encoding="utf-8") as f:
+            json.dump({"titles": TITLES}, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[WARN] save_titles failed: {e}")
+
+def load_titles():
+    global TITLES
+    try:
+        p = Path(TITLES_FILE)
+        if not p.exists():
+            return
+        with p.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        TITLES = data.get("titles", {})
+    except Exception as e:
+        print(f"[WARN] load_titles failed: {e}")
+
+# ----- Class attendance -----
+BCLASS_FILE = os.getenv("FIERTE_BCLASS", "fierte_bclass.json")
+BCLASS_ACTIVE = {}
+BCLASS_HISTORY = {}
+
+def save_bclass():
+    try:
+        with open(BCLASS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"active": BCLASS_ACTIVE, "history": BCLASS_HISTORY}, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[WARN] save_bclass failed: {e}")
+
+def load_bclass():
+    global BCLASS_ACTIVE, BCLASS_HISTORY
+    try:
+        p = Path(BCLASS_FILE)
+        if not p.exists():
+            return
+        with p.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        BCLASS_ACTIVE = data.get("active", {})
+        BCLASS_HISTORY = data.get("history", {})
+        # migrasi bentuk lama → list
+        changed = False
+        for ch_key, dates in list(BCLASS_HISTORY.items()):
+            if not isinstance(dates, dict):
+                continue
+            for date_str, bucket in list(dates.items()):
+                if isinstance(bucket, dict) and "rows" in bucket:
+                    BCLASS_HISTORY[ch_key][date_str] = [bucket]
+                    changed = True
+        if changed:
+            save_bclass()
+    except Exception as e:
+        print(f"[WARN] load_bclass failed: {e}")
+
+# ---------- Helpers ----------
+def _is_owner(user) -> bool:
+    return (user.username or "").lower() == OWNER_USERNAME.lower()
+
+def _status_for_user(user_id: int) -> str:
+    if user_id in admin_ids:
+        return "Currathor of Eryndale"
+    if user_id in PROFESSORS:
+        return "Professor of Eryndale"
+    return "Student of Eryndale"
+
+def _ensure_account_defaults(uid: int):
+    rec = ACCOUNTS.setdefault(str(uid), {})
+    rec.setdefault("acc_no", None)
+    rec.setdefault("name", "-")
+    rec.setdefault("pilar", "-")
+    rec.setdefault("created_at", datetime.now().strftime("%Y-%m-%d %H:%M"))
+    rec.setdefault("idc_custom_png", None)
+    rec.setdefault("titles", [])             # legacy
+    rec.setdefault("active_titles", [])      # legacy
+    rec.setdefault("title_inventory_ids", [])
+    rec.setdefault("active_title_ids", [])
+    rec.setdefault("divine_bless", "-")
+    rec.setdefault("divine_bless_pending", None)  # untuk /addskill
+    rec.setdefault("photo_file_id", None)
+    rec.setdefault("photo_file_id_png", None)
+    return rec
+
+def _next_account_number() -> int:
+    if FREED_NUMBERS:
+        FREED_NUMBERS.sort()
+        return FREED_NUMBERS.pop(0)
+    used = [int(k) for k in ACCOUNT_INDEX.keys()] if ACCOUNT_INDEX else []
+    return (max(used) + 1) if used else 1
+
+def _is_privileged(user) -> bool:
+    return _is_owner(user) or (user.id in admin_ids) or (user.id in PROFESSORS)
+
+def _is_currathor(user) -> bool:
+    return _is_owner(user) or (user.id in admin_ids)
+
+def _is_student(uid: int, username: str | None) -> bool:
+    if uid in admin_ids: return False
+    if uid in PROFESSORS: return False
+    if (username or "").lower() == OWNER_USERNAME.lower(): return False
+    return True
+
+def _eligible_for_class(pilar: str, subject: str) -> bool:
+    subject = subject.lower()
+    if subject == "elemental":
+        return True
+    if subject == "battle":
+        return pilar == "Eridorian"
+    if subject == "riddle":
+        return pilar == "Zenict"
+    return False
+
+def _chunk_lines(lines, max_chars=3500):
+    chunks, buf, size = [], [], 0
+    for line in lines:
+        if size + len(line) + 1 > max_chars and buf:
+            chunks.append("\n".join(buf)); buf, size = [], 0
+        buf.append(line); size += len(line) + 1
+    if buf: chunks.append("\n".join(buf))
+    return chunks
+
+# === Title helpers ===
+def _next_title_id() -> int:
+    if not TITLES:
+        return 1
+    try:
+        return max(int(k) for k in TITLES.keys()) + 1
+    except Exception:
+        return 1
+
+def _get_title_name(tid: int | str) -> str:
+    t = TITLES.get(str(tid))
+    return t.get("name") if t else None
+
+def _user_inventory_ids(uid: int) -> list[int]:
+    _ensure_account_defaults(uid)
+    inv = ACCOUNTS[str(uid)].setdefault("title_inventory_ids", [])
+    if not isinstance(inv, list):
+        inv = []
+        ACCOUNTS[str(uid)]["title_inventory_ids"] = inv
+    return [int(x) for x in inv]
+
+def _user_active_ids(uid: int) -> list[int]:
+    _ensure_account_defaults(uid)
+    act = ACCOUNTS[str(uid)].setdefault("active_title_ids", [])
+    if not isinstance(act, list):
+        act = []
+        ACCOUNTS[str(uid)]["active_title_ids"] = act
+    return [int(x) for x in act]
+
+# === Divine Bless: bubble builders ===
+def build_divine_bless_request_bubble(user, uid: int, rec: dict, text_input: str) -> str:
+    usn = f"@{user.username}" if getattr(user, "username", None) else (getattr(user, "first_name", None) or f"uid:{uid}")
+    acc_no = rec.get("acc_no", "-")
+    name = rec.get("name", "-")
+    pilar = rec.get("pilar", "-")
+    joined = rec.get("created_at", "-")
+    status = _status_for_user(uid)
+
+    header = "📝 Divine Bless — ᴘᴇɴᴅɪɴɢ"
+    prof = (
+        "ㅤ\n"
+        "ㅤ              𝑬𝒓𝒴𝒏𝒅𝒂𝒍𝒆 𝑰𝒏𝒔𝒕𝒊𝒕𝒖𝒕𝒆\n"
+        "⌜データ⌟ .. ╱ 𝐷𝑎𝑡𝑎 𝐼𝑛𝑓𝑜𝑟𝑚𝑎𝑡𝑖𝑜𝑛 ༗ ꯭ ’ㅤ\n\n"
+        "📜 ⟢ プロフィール ‹ ᴘʀᴏꜰɪʟᴇ › \n"
+        f"› Account Number : {acc_no}\n"
+        f"› Username : {usn}\n"
+        f"› Full Name : {name}\n"
+        f"› Pilar : {pilar}\n"
+        f"› Joined : {joined}\n\n"
+        "📜 ⟢ ステータス ‹ sᴛᴀᴛᴜs ›\n"
+        f"› {status}\n"
+    )
+
+    body = (
+        "\n.. ⟢ ‹ ᴘᴇɴɢᴀᴊᴜᴀɴ ᴅɪᴠɪɴᴇ ʙʟᴇss ›\n"
+        "𖠷 ╱\n"
+        f"{text_input.strip() or '—'}\n"
+    )
+
+    footer = (
+        "\n— — —\n"
+        f"Currathor: balas pesan ini lalu kirim /divinebless approve atau /divinebless reject\n"
+        f"(uid:{uid})"
+    )
+    return f"{header}\n{prof}{body}{footer}"
+
+def build_divine_bless_approved_bubble(rec: dict) -> str:
+    bless_text = (rec.get("divine_bless", "-") or "").strip()
+    return (
+        "⟡ ₊ . ᴅɪᴠɪɴᴇ ʙʟᴇss ᴅɪᴛᴇᴛᴀᴘᴋᴀɴ\n"
+        "\n.. ⟢ ‹ ᴅɪᴠɪɴᴇ ʙʟᴇss ›\n"
+        "𖠷 ╱\n"
+        f"{bless_text or '—'}"
+    )
+
+# --- Helper: ambil payload asli setelah /addskill (baris baru tetap utuh)
+def _get_command_payload_text(msg, cmd="/addskill"):
+    """
+    Mengembalikan teks SETELAH perintah, tanpa merusak baris baru.
+    Bekerja untuk '/addskill' maupun '/addskill@NamaBot'.
+    """
+    txt = (getattr(msg, "text", None) or getattr(msg, "caption", "") or "")
+    if not txt:
+        return ""
+    ents = getattr(msg, "entities", None) or []
+    # Jika entitas pertama adalah BOT_COMMAND di awal, ambil sisanya persis apa adanya
+    if ents and ents[0].type == MessageEntityType.BOT_COMMAND and ents[0].offset == 0:
+        start = ents[0].offset + ents[0].length
+        return txt[start:].lstrip("\n ").rstrip()
+    # Fallback: buang prefix '/addskill' manual
+    if txt.lower().startswith(cmd):
+        return txt[len(cmd):].lstrip("\n ").rstrip()
+    return txt.strip()
+
+# ---- Safe send helpers + debug ----
+async def _send_public_safe(context: ContextTypes.DEFAULT_TYPE, text: str, reply_to=None):
+    try:
+        await context.bot.send_message(chat_id=FORWARD_PUBLIC_CHAT_ID, text=text)
+        return True
+    except Exception as e:
+        if reply_to:
+            try:
+                await reply_to.reply_text(
+                    f"❌ Gagal meneruskan ke PUBLIC.\n"
+                    f"ID: {FORWARD_PUBLIC_CHAT_ID}\n"
+                    f"Detail: {e}\n"
+                    f"Tips: pastikan bot sudah join & punya izin kirim."
+                )
+            except Exception:
+                pass
+        print(f"[PUBLIC SEND ERROR] {e}")
+        return False
+
+async def _send_stafftalk_safe(context: ContextTypes.DEFAULT_TYPE, text: str, reply_to=None):
+    try:
+        await context.bot.send_message(chat_id=FORWARD_STAFFTALK_CHAT_ID, text=text)
+        return True
+    except Exception as e:
+        if reply_to:
+            try:
+                await reply_to.reply_text(
+                    f"❌ Gagal meneruskan ke Currathor.\n"
+                    f"ID: {FORWARD_STAFFTALK_CHAT_ID}\n"
+                    f"Detail: {e}"
+                )
+            except Exception:
+                pass
+        print(f"[STAFFTALK SEND ERROR] {e}")
+        return False
+
+# ---------- STATES ----------
+INTRO_ASK_NAME, INTRO_ASK_PILAR = range(2)
+REG_CHOOSING, REG_TYPING, REG_CONFIRM = range(3)
+# Alias untuk ConversationHandler (back-compat)
+CHOOSING, TYPING, CONFIRM = REG_CHOOSING, REG_TYPING, REG_CONFIRM
+
+# ---------- Tambahan Command ----------
+async def mystat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    s = user_stats.get(user.id, {})
+    if not s:
+        await update.message.reply_text("ⓘ | Belum ada atribut. Gunakan /rollatr lebih dulu.")
+        return
+    vals = [f"› {k}: {'' if s.get(k) is None else s.get(k)}" for k in ["STR","CON","DEX","INT","VGR","CHA"]]
+    text = ".. ⟢ ‹ ᴅɪᴠɪɴᴇ ᴀᴛʀɪʙᴜᴛᴇ ›\n" + "\n".join(vals)
+    await update.message.reply_text(text)
+
+# ---------- ERYNDALE USER ACCOUNT ----------
+async def introduction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    if uid in ACCOUNTS:
+        await update.message.reply_text("ⓘ Telah terpatri persona milikmu; bila hendak berganti nama, sebutlah /changemyacc.")
+        return ConversationHandler.END
+
+    context.user_data["intro"] = {"step": "name", "owner_id": update.effective_user.id}
+    await update.message.reply_text("Nama apakah yang hendak kau titipkan di sini?")
+    return INTRO_ASK_NAME
+
+async def intro_ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    intro = context.user_data.get("intro") or {}
+    if intro.get("owner_id") and intro["owner_id"] != update.effective_user.id:
+        await update.message.reply_text("ⓘ Sesi /introduction ini bukan milikmu.")
+        return INTRO_ASK_NAME
+
+    name = (update.message.text or "").strip()
+    if not name:
+        await update.message.reply_text("ⓘ Lembar ini hampa, ukirlah kembali namamu.")
+        return INTRO_ASK_NAME
+
+    context.user_data.setdefault("intro", {})["name"] = name
+
+    kb = [
+        [InlineKeyboardButton("Zenict", callback_data="pillar:Zenict"),
+         InlineKeyboardButton("Eridorian", callback_data="pillar:Eridorian")]
+    ]
+    await update.message.reply_text("Pilih Pilaresimu:", reply_markup=InlineKeyboardMarkup(kb))
+    return INTRO_ASK_PILAR
+
+async def intro_ask_pilar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+
+    data = (q.data or "").strip()
+    if not data.startswith("pillar:"):
+        return
+
+    intro = context.user_data.get("intro") or {}
+    owner_id = intro.get("owner_id")
+    if owner_id and q.from_user.id != owner_id:
+        try:
+            await q.answer("Ini bukan sesi milikmu.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    pilar = data.split(":", 1)[1].strip()
+    if pilar not in ("Zenict", "Eridorian"):
+        try:
+            await q.answer("Pilihan pilar tidak dikenali.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    name = (intro.get("name") or "").strip()
+    if not name:
+        try:
+            await q.edit_message_text("Sesi ini telah usai, panggillah kembali dengan /introduction.")
+        except Exception:
+            pass
+        return ConversationHandler.END
+
+    user = q.from_user
+    uid_str = str(user.id)
+
+    if uid_str in ACCOUNTS:
+        try:
+            await q.edit_message_text("ⓘ Persona telah kaubuat; tiada insan diperkenan memiliki dua.")
+        except Exception:
+            pass
+        return ConversationHandler.END
+
+    acc_no = _next_account_number()
+    ACCOUNTS[uid_str] = {
+        "acc_no": acc_no,
+        "name": name,
+        "pilar": pilar,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "idc_custom_png": None,
+        "titles": [],
+        "active_titles": [],
+        "title_inventory_ids": [],
+        "active_title_ids": [],
+        "divine_bless": "-",
+        "divine_bless_pending": None,
+        "photo_file_id": None,
+        "photo_file_id_png": None,
+    }
+    ACCOUNT_INDEX[str(acc_no)] = uid_str
+    save_accounts()
+
+    usn = f"@{user.username}" if user.username else "-"
+    status = _status_for_user(user.id)
+    joined = ACCOUNTS[uid_str].get("created_at", "")
+
+    bubble = (
+        "ㅤ\n"
+        "ㅤ              𝑬𝒓𝒚𝒏𝒅𝒂𝒍𝒆 𝑰𝒏𝒔𝒕𝒊𝒕𝒖𝒕𝒆\n"
+        "⌜データ⌟ .. ╱ 𝐷𝑎𝑡𝑎 𝐼𝑛𝑓𝑜𝑟𝑚𝑎𝑡𝑖𝑜𝑛 ༗  ’ㅤ\n\n"
+        "📜 ⟢ プロフィール ‹ ᴘʀᴏꜰɪʟᴇ › \n"
+        f"› Account Number : {acc_no}\n"
+        f"› Username : {usn}\n"
+        f"› Full Name : {name}\n"
+        f"› Pilar : {pilar}\n"
+        f"› Joined : {joined}\n\n"
+        "📜 ⟢ ステータス ‹ sᴛᴀᴛᴜs ›\n"
+        f"› {status}"
+    )
+
+    try:
+        await q.edit_message_text("⟡ ݁₊ . Sudah lahir satu persona bagimu; jagalah ia, sebab ia adalah wajahmu di tanah ini.")
+    except Exception as e:
+        print(f"[intro_ask_pilar] edit_message_text fail: {e}")
+
+    try:
+        await context.bot.send_message(chat_id=user.id, text=bubble)
+    except Exception as e:
+        print(f"[intro_ask_pilar] DM fail: {e}")
+        try:
+            await context.bot.send_message(chat_id=q.message.chat.id, text=bubble)
+        except Exception as e2:
+            print(f"[intro_ask_pilar] fallback send fail: {e2}")
+
+    context.user_data.pop("intro", None)
+    return ConversationHandler.END
+
+async def changemyacc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    if uid not in ACCOUNTS:
+        await update.message.reply_text("ⓘ Belum terpatri persona bagimu; mulailah perjalananmu melalui /introduction.")
+        return
+    kb = [
+        [InlineKeyboardButton("Ganti Nama", callback_data="accchg:name")],
+        [InlineKeyboardButton("Atur Title", callback_data="accchg:title")],
+        [InlineKeyboardButton("Batal", callback_data="accchg:cancel")],
+    ]
+    await update.message.reply_text(
+        "Pilih perubahan (pilar hanya dapat diubah oleh Currathor):",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+async def acc_change_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, kind = q.data.split(":", 1)
+    if kind == "cancel":
+        await q.edit_message_text("Telah dibatalkan.")
+        return
+    if kind == "name":
+        context.user_data["acc_edit"] = "name"
+        await q.edit_message_text("Sebutlah nama baru yang kau pilih; /cancel jika kehendakmu surut.")
+        return
+    if kind == "title":
+        await _render_title_picker(q.message, q.from_user.id)
+        return
+
+async def _render_title_picker(message, uid: int):
+    inv = _user_inventory_ids(uid)
+    act = set(_user_active_ids(uid))
+
+    if not inv:
+        try:
+            await message.edit_text("Kau belum memiliki title apa pun. Currathor dapat memberikannya padamu.")
+        except Exception:
+            await message.reply_text("Kau belum memiliki title apa pun. Currathor dapat memberikannya padamu.")
+        return
+
+    rows = []
+    for tid in sorted(inv):
+        name = _get_title_name(tid) or f"(#{tid})"
+        prefix = "✅" if tid in act else "☐"
+        rows.append([InlineKeyboardButton(f"{prefix} {name}", callback_data=f"ttlset:toggle:{tid}")])
+    rows.append([InlineKeyboardButton("Selesai", callback_data="ttlset:save")])
+
+    txt = "Pilih hingga 5 title untuk dipasang:"
+    try:
+        await message.edit_text(txt, reply_markup=InlineKeyboardMarkup(rows))
+    except Exception:
+        await message.reply_text(txt, reply_markup=InlineKeyboardMarkup(rows))
+
+async def title_set_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    uid = q.from_user.id
+    inv = _user_inventory_ids(uid)
+    act = set(_user_active_ids(uid))
+
+    if data == "ttlset:save":
+        try:
+            await q.edit_message_text("Title aktif disimpan.")
+        except Exception:
+            pass
+        ACCOUNTS[str(uid)]["active_title_ids"] = list(act)
+        save_accounts()
+        return
+
+    if data.startswith("ttlset:toggle:"):
+        try:
+            tid = int(data.split(":")[2])
+        except Exception:
+            await q.answer("Data tidak valid.", show_alert=True)
+            return
+        if tid not in inv:
+            await q.answer("Title tidak ada di inventory-mu.", show_alert=True)
+            return
+        if tid in act:
+            act.remove(tid)
+        else:
+            if len(act) >= 5:
+                await q.answer("Maksimal 5 title aktif.", show_alert=True)
+                return
+            act.add(tid)
+        ACCOUNTS[str(uid)]["active_title_ids"] = list(act)
+        save_accounts()
+        await _render_title_picker(q.message, uid)
+
+# ---------- ROUTER USER ACCOUNT (edit nama) ----------
+async def account_edit_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mode = context.user_data.get("acc_edit")
+    if not mode:
+        return
+
+    uid = str(update.effective_user.id)
+    if uid not in ACCOUNTS:
+        context.user_data.pop("acc_edit", None)
+        await update.message.reply_text("ⓘ Tiada persona terpatri; ciptakan dulu dengan /introduction.")
+        return
+
+    if mode == "name":
+        name = (update.message.text or "").strip()
+        if not name:
+            await update.message.reply_text("ⓘ Lembar ini hampa, ukirlah kembali namamu.")
+            return
+
+        ACCOUNTS[uid]["name"] = name
+        save_accounts()
+
+        user = update.effective_user
+        rec = ACCOUNTS[uid]
+        acc_no = rec.get("acc_no", "")
+        pilar = rec.get("pilar", "-")
+        joined = rec.get("created_at", "")
+        usn = f"@{user.username}" if user.username else "-"
+        status = _status_for_user(user.id)
+
+        bubble = (
+            "ㅤ\n"
+            "ㅤ              𝑬𝒓𝒚𝒏𝒅𝒂𝒍𝒆 𝑰𝒏𝒔𝒕𝒊𝒕𝒖𝒕𝒆\n"
+            "⌜データ⌟ .. ╱ 𝐷𝑎𝑡𝑎 𝐼𝑛𝑓𝑜𝑟𝑚𝑎𝑡𝑖𝑜𝑛 ༗  ’ㅤ\n\n"
+            "📜 ⟢ プロフィール ‹ ᴘʀᴏꜰɪʟᴇ › \n"
+            f"› Account Number : {acc_no}\n"
+            f"› Username : {usn}\n"
+            f"› Full Name : {name}\n"
+            f"› Pilar : {pilar}\n"
+            f"› Joined : {joined}\n\n"
+            "📜 ⟢ ステータス ‹ sᴛᴀᴛᴜs ›\n"
+            f"› {status}"
+        )
+
+        await update.message.reply_text("Nama diperbarui.")
+        await update.message.reply_text(bubble)
+
+        context.user_data.pop("acc_edit", None)
+        return
+
+# === ID Card helpers & commands ===
+async def _make_idc_bytes(context: ContextTypes.DEFAULT_TYPE, uid: int):
+    _ensure_account_defaults(uid)
+    rec = ACCOUNTS.get(str(uid), {})
+    path = rec.get("idc_custom_png")
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        bio = BytesIO(p.read_bytes())
+        bio.name = p.name
+        bio.seek(0)
+        return bio
+    except Exception as e:
+        print(f"[_make_idc_bytes] gagal: {e}")
+        return None
+
+async def setidc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    if uid not in ACCOUNTS:
+        await update.message.reply_text("Buat akun dulu via /introduction.")
+        return
+
+    msg = update.message
+    reply = msg.reply_to_message
+    if not reply:
+        await update.message.reply_text("Balas (reply) ke gambar ID Card, lalu kirim /setidc.")
+        return
+
+    file = None
+    if reply.photo:
+        file = await context.bot.get_file(reply.photo[-1].file_id)
+    elif reply.document and (reply.document.mime_type or "").startswith("image/"):
+        file = await context.bot.get_file(reply.document.file_id)
+
+    if not file:
+        await update.message.reply_text("Gambar tidak ditemukan. Balas (reply) ke foto/dokumen gambar.")
+        return
+
+    try:
+        data = await file.download_as_bytearray()
+        cache_dir = BASE_DIR / "idc_cache"
+        cache_dir.mkdir(exist_ok=True)
+        out_path = cache_dir / f"{uid}_idc_manual.png"
+        with open(out_path, "wb") as f:
+            f.write(data)
+
+        _ensure_account_defaults(int(uid))
+        ACCOUNTS[uid]["idc_custom_png"] = str(out_path)
+        save_accounts()
+        await update.message.reply_text("✅ ID Card manual tersimpan. (/myinfo akan menampilkannya)")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Gagal menyimpan ID Card: {e}")
+
+async def clearidc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    if uid not in ACCOUNTS:
+        await update.message.reply_text("Buat akun dulu via /introduction.")
+        return
+    _ensure_account_defaults(int(uid))
+    ACCOUNTS[uid]["idc_custom_png"] = None
+    save_accounts()
+    await update.message.reply_text("🗑️ ID Card manual dihapus.")
+
+# ---------- MYINFO (REFACTORED TABS) ----------
+def _build_myinfo_general_text(user, rec) -> str:
+    def _clean(v: str) -> str:
+        v = (v or "").strip()
+        return "" if v == "-" else v
+
+    usn = f"@{user.username}" if user.username else "-"
+    acc = rec.get("acc_no", "")
+    name = _clean(rec.get("name", ""))
+    pilar = _clean(rec.get("pilar", ""))
+    joined = _clean(rec.get("created_at", ""))
+    status = _status_for_user(user.id)
+
+    active_ids = rec.get("active_title_ids", []) or []
+    leg_lines = []
+    for tid in active_ids:
+        t = TITLES.get(str(tid))
+        if t:
+            leg_lines.append(f"› {t['name']}")
+    if not leg_lines:
+        legacy_act = rec.get("active_titles", []) or []
+        for tname in legacy_act[:5]:
+            leg_lines.append(f"› {tname}")
+    if not leg_lines:
+        leg_lines = ["› —"]
+
+    return (
+        "ㅤ\n"
+        "ㅤ              𝑬𝒓𝒚𝒏𝒅𝒂𝒍𝒆 𝑰𝒏𝒔𝒕𝒊𝒕𝒖𝒕𝒆\n"
+        "⌜データ⌟ .. ╱ 𝐷𝑎𝑡𝑎 𝐼𝑛𝑓𝑜𝑟𝑚𝑎𝑡𝑖𝑜𝑛 ༗  ’ㅤ\n\n"
+        "📜 ⟢ プロフィール ‹ ᴘʀᴏꜰɪʟᴇ › \n"
+        f"› Account Number : {acc}\n"
+        f"› Username : {usn}\n"
+        f"› Full Name : {name}\n"
+        f"› Pilar : {pilar}\n"
+        f"› Joined : {joined}\n\n"
+        "📜 ⟢ ステータス ‹ sᴛᴀᴛᴜs ›\n"
+        f"› {status}\n\n"
+        ".. ⟢ ‹ ʟᴇɢᴀᴄɪᴇs ᴏꜰ ʜᴇʀᴏᴇs ›\n" +
+        "\n".join(leg_lines)
+    )
+
+def _build_myinfo_divine_text(user, rec) -> str:
+    us = user_stats.get(user.id, {})
+    def statv(k):
+        v = us.get(k)
+        return "" if v is None else str(v)
+
+    bless_block = ""
+    bless_value = (rec.get("divine_bless") or "").strip()
+    if (rec.get("pilar") or "") == "Eridorian" and bless_value and bless_value != "-":
+        bless_block = (
+            "\n.. ⟢ ‹ ᴅɪᴠɪɴᴇ ʙʟᴇss ›\n"
+            "𖠷 ╱\n"
+            f"{bless_value}\n"
+        )
+
+    return (
+        "ㅤ\n"
+        "ㅤ              𝑬𝒓𝒴𝒏𝒅𝒂𝒍𝒆 𝑰𝒏𝒇𝒐𝒓𝒎𝒂𝑠𝒊\n"
+        "⌜データ⌟ .. ╱ 𝐷𝑎𝑡𝑎 𝐼𝑛𝑓𝑜𝑟𝑚𝑎𝑡𝑖𝑜𝑛 ༗  ’ㅤ\n\n"
+        ".. ⟢ ‹ ᴅɪᴠɪɴᴇ ᴀᴛʀɪʙᴜᴛᴇ ›\n"
+        f"› STR : {statv('STR')}\n"
+        f"› CON : {statv('CON')}\n"
+        f"› DEX : {statv('DEX')}\n"
+        f"› INT : {statv('INT')}\n"
+        f"› VGR : {statv('VGR')}\n"
+        f"› CHA : {statv('CHA')}\n"
+        f"{bless_block}"
+    )
+
+def _myinfo_keyboard(uid: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("General Information", callback_data=f"myinfo:show:general:{uid}")],
+        [InlineKeyboardButton("Divine Information",  callback_data=f"myinfo:show:divine:{uid}")],
+        [InlineKeyboardButton("Close", callback_data=f"myinfo:close:{uid}")]
+    ])
+
+async def myinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    uid_str = str(user.id)
+    rec = ACCOUNTS.get(uid_str)
+    if not rec:
+        await update.message.reply_text("ⓘ Belum terpatri persona bagimu; mulailah perjalananmu melalui /introduction.")
+        return
+    _ensure_account_defaults(user.id)
+
+    try:
+        pic = await _make_idc_bytes(context, user.id)
+        if pic:
+            await update.message.reply_photo(pic, caption="ID Card-mu.")
+    except Exception as e:
+        print(f"[myinfo IDC send] {e}")
+
+    text = _build_myinfo_general_text(user, rec)
+    kb = _myinfo_keyboard(user.id)
+    await update.message.reply_text(text, reply_markup=kb)
+
+async def myinfo_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = (q.data or "").split(":")
+    if len(data) < 2 or data[0] != "myinfo":
+        return
+
+    action = data[1]
+    if action == "show":
+        if len(data) < 4:
+            return
+        tab = data[2]
+        try:
+            target_uid = int(data[3])
+        except Exception:
+            target_uid = q.from_user.id
+
+        rec = ACCOUNTS.get(str(target_uid))
+        if not rec:
+            try:
+                await q.edit_message_text("ⓘ Persona tidak ditemukan.")
+            except Exception:
+                pass
+            return
+
+        viewer = q.from_user
+        if tab == "general":
+            new_text = _build_myinfo_general_text(viewer, rec)
+        else:
+            new_text = _build_myinfo_divine_text(viewer, rec)
+
+        kb = _myinfo_keyboard(target_uid)
+        try:
+            await q.edit_message_text(new_text, reply_markup=kb)
+        except Exception as e:
+            print(f"[myinfo_cb show] {e}")
+        return
+
+    if action == "close":
+        try:
+            await q.message.delete()
+        except Exception:
+            try:
+                await q.edit_message_text("Ditutup.")
+            except Exception:
+                pass
+        return
+
+# ---------- CANCEL SERBAGUNA ----------
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cancelled = []
+    if context.user_data.pop("intro", None) is not None:
+        cancelled.append("introduction")
+    if context.user_data.pop("acc_edit", None) is not None:
+        cancelled.append("edit akun")
+    if context.user_data.pop("menu_mode", None) is not None:
+        cancelled.append("menu")
+    if context.user_data.pop("talk_mode", None) is not None:
+        cancelled.append("talk")
+    if cancelled:
+        await update.message.reply_text("Telah Dibatalkan: " + ", ".join(cancelled) + ".")
+    else:
+        await update.message.reply_text("Tidak ada proses yang berjalan.")
+    return ConversationHandler.END
+
+# ---------- ROLL ATTRIBUTE ----------
+ATTRIBUTES = ["STR", "CON", "DEX", "INT", "VGR", "CHA"]
+
+def roll_stat():
+    rolls = [random.randint(1, 6) for _ in range(4)]
+    total = sum(rolls) - min(rolls)
+    return rolls, total
+
+async def rollatr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = user.id
+    if user_id not in user_rolls:
+        user_rolls[user_id] = {"tries": 0, "sets": [], "picked": None}
+    if user_rolls[user_id]["tries"] >= 3:
+        await update.message.reply_text("ⓘ | Batas tiga undian tercapai. Tak bisa melangkah lebih jauh.")
+        return
+    rolls = [roll_stat() for _ in range(6)]
+    user_rolls[user_id]["sets"].append(rolls)
+    user_rolls[user_id]["tries"] += 1
+    text = f"٪.. ⓘ Generated random stats (Roll ke-{user_rolls[user_id]['tries']}).\n\n"
+    total_sum = 0
+    for i, (nums, total) in enumerate(rolls, 1):
+        text += f"𝗦𝘁𝗮𝘁 {i}: {tuple(nums)} = {total}\n"
+        total_sum += total
+    text += f"\n𝗧𝗢𝗧𝗔𝗟 {total_sum}"
+    buttons = [[InlineKeyboardButton(f"Pick Set {user_rolls[user_id]['tries']}", callback_data=f"pick:{user_id}:{user_rolls[user_id]['tries']-1}")]]
+    reply_markup = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(text, reply_markup=reply_markup)
+
+async def pickatr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, user_id, set_index = query.data.split(":")
+    user_id = int(user_id); set_index = int(set_index)
+    user_rolls.setdefault(user_id, {"tries": 0, "sets": [], "picked": None})
+    if set_index < 0 or set_index >= len(user_rolls[user_id]["sets"]):
+        await query.edit_message_text("ⓘ | Set tidak ditemukan.")
+        return
+    user_rolls[user_id]["picked"] = set_index
+    user_stats[user_id] = {attr: None for attr in ATTRIBUTES}
+    user_stats[user_id]["used_stats"] = []
+    text = f"ⓘ | Tapakmu berpijak di Set {set_index+1}.\nKini, tetapkan Stat bagi tiap Atribut."
+    buttons = [[InlineKeyboardButton(attr, callback_data=f"attr:{user_id}:{attr}")] for attr in ATTRIBUTES]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+async def assign_attr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, user_id, attr = query.data.split(":")
+    user_id = int(user_id)
+    picked_set = user_rolls.get(user_id, {}).get("picked")
+    if picked_set is None:
+        await query.edit_message_text("ⓘ | Belum memilih set.")
+        return
+    rolls = user_rolls[user_id]["sets"][picked_set]
+    buttons = []
+    for i, (nums, total) in enumerate(rolls, 1):
+        if i not in user_stats[user_id]["used_stats"]:
+            buttons.append([InlineKeyboardButton(f"Stat {i} = {total}", callback_data=f"usestat:{user_id}:{i}:{attr}")])
+    await query.edit_message_text(f"Torehkan Stat untuk {attr}:", reply_markup=InlineKeyboardMarkup(buttons))
+
+async def usestat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, user_id, stat_num, attr = query.data.split(":")
+    user_id = int(user_id); stat_num = int(stat_num)
+    picked_set = user_rolls.get(user_id, {}).get("picked")
+    if picked_set is None:
+        await query.edit_message_text("ⓘ | Belum memilih set.")
+        return
+    rolls = user_rolls[user_id]["sets"][picked_set]
+    if stat_num < 1 or stat_num > len(rolls):
+        await query.edit_message_text("ⓘ | Stat tidak valid.")
+        return
+    chosen = rolls[stat_num-1][1]
+    if attr in user_stats[user_id] and user_stats[user_id][attr] is not None:
+        await query.edit_message_text(f"ⓘ | Jejak {attr} telah terisi, tak bisa ditorehkan kembali.")
+        return
+    user_stats[user_id][attr] = chosen
+    user_stats[user_id]["used_stats"].append(stat_num)
+    text = f"𖠷 ╱..  {attr} terpahat sebagai  {chosen}  dalam lembar Stat: {stat_num}."
+    if all(user_stats[user_id][a] is not None for a in ATTRIBUTES):
+        final_stats = "\n".join([f"{a}: {user_stats[user_id][a]}" for a in ATTRIBUTES])
+        text += f"\n\n♝ Seluruh Atributmu kini lengkap, sempurnalah susunannya!\n{final_stats}"
+        await query.edit_message_text(text)
+    else:
+        buttons = [[InlineKeyboardButton(attr, callback_data=f"attr:{user_id}:{attr}")]
+                   for attr in ATTRIBUTES if user_stats[user_id][attr] is None]
+        await query.edit_message_text(text + "\n\nPilih Atribut selanjutnya:", reply_markup=InlineKeyboardMarkup(buttons))
+
+# ---------- DIVINE DICE ----------
+async def divine(update, context):
+    if len(context.args) == 0:
+        await update.message.reply_text("Format: /divine d20 atau /divine 2d20+3")
+        return
+    try:
+        arg = context.args[0].lower()
+        modifier = 0
+        if "+" in arg:
+            dice_part, mod_part = arg.split("+", 1); modifier = int(mod_part)
+        elif "-" in arg[1:]:
+            dice_part, mod_part = arg.split("-", 1); modifier = -int(mod_part)
+        else:
+            dice_part = arg
+        if dice_part.startswith("d"):
+            jumlah = 1; sisi = int(dice_part[1:])
+        else:
+            jumlah, sisi = dice_part.split("d"); jumlah = int(jumlah); sisi = int(sisi)
+        hasil = [random.randint(1, sisi) for _ in range(jumlah)]
+        total = sum(hasil); final_total = total + modifier
+        hasil_str = ", ".join(str(x) for x in hasil)
+        username = update.message.from_user.username or update.message.from_user.first_name
+        if modifier == 0:
+            text = f"@{username} — 🎲\n𝗥𝗲𝘀𝘂𝗹𝘁: {hasil_str}\n𝗧𝗼𝘁𝗮𝗹: {final_total}"
+        else:
+            text = f"@{username} — 🎲\n𝗥𝗲𝘀𝘂𝗹𝘁: {jumlah}d{sisi} ({hasil_str}) {'+' if modifier > 0 else ''}{modifier}\n𝗧𝗼𝘁𝗮𝗹: {final_total}"
+        await update.message.reply_text(text)
+    except Exception:
+        await update.message.reply_text("Tata caramu keliru. Tegakkan kembali: /divine 2d20, /divine 2d20+3, /divine d12-1.")
+
+# ---------- REGISTRATION HELPERS ----------
+def _reg_label(kind: str) -> str:
+    mapping = {
+        "calon_pelajar": "Calon Pelajar Eryndale",
+        "pengurus": "Pengurus Eryndale",
+        "media_partner": "Media Partner",
+        "sponsorship": "Sponsorship",
+        "event": "Pendaftaran Event",
+    }
+    return mapping.get(kind, kind)
+
+def _is_reg_open(kind: str) -> bool:
+    return bool(REG_OPEN_FLAGS.get(kind, True))
+
+# ---------- MENU ----------
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [
+        [InlineKeyboardButton("Perihal Eryndale", url=ERYNDALE_URL),
+         InlineKeyboardButton("Kritik dan Saran", callback_data="menu:kritik")],
+        [InlineKeyboardButton("Bisikan tanpa nama", callback_data="menu:menfess"),
+         InlineKeyboardButton("Fierte Talk", callback_data="menu:talk")],
+    ]
+    text = (
+        "𖠷 ╱..  Tentukanlah pilihan di hadapanmu, sebab tiap jalur menyimpan takdirmu ﹔\n\n"
+        "：！𝐏𝐞𝐫𝐢𝐡𝐚𝐥 𝐄𝐫𝐲𝐧𝐝𝐚𝐥𝐞 : untukmu yang mendamba tahu, tersingkaplah seluk-beluk institut\n"
+        "：！𝐊𝐫𝐢𝐭𝐢𝐤 𝐝𝐚𝐧 𝐒𝐚𝐫𝐚𝐧 : untukmu yang ingin mengukir tegur dan titah\n"
+        "：！𝐁𝐢𝐬𝐢𝐤𝐚𝐧 𝐭𝐚𝐧𝐩𝐚 𝐧𝐚𝐦𝐚 : untukmu yang menyimpan getar rasa, tak sanggup terucap langsung pada dirinya.\n"
+        "：！𝐅𝐢𝐞𝐫𝐭𝐞 𝐓𝐚𝐥𝐤 : kirim pesan langsung ke Currathor (mode privat)."
+    )
+    await update.effective_message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, kind = query.data.split(":", 1)
+    context.user_data.pop("menu_mode", None)
+    if kind == "kritik":
+        context.user_data["menu_mode"] = "kritik"
+        await query.edit_message_text(
+            "𖠷 ╱.. Titipkan kritik dan saran padaku bila berkenan; "
+            "namun jika hatimu berpaling, /cancel-lah jalannya"
+        )
+        return
+    if kind == "menfess":
+        context.user_data["menu_mode"] = "menfess"
+        await query.edit_message_text(
+            "📫  …  Titipkan rasa yang enggan terucap, biarlah aku yang menyampaikan pada yang kau tuju .♡\n\n"
+            "Format (bebas juga boleh):\n"
+            "• Dari: (boleh kosong/anonim)\n"
+            "• Kepada: (nama/username)\n"
+            "• Pesan: …"
+        )
+        return
+    if kind == "talk":
+        context.user_data["talk_mode"] = True
+        await query.edit_message_text(
+            "🎧  Fierte Talk aktif.\n"
+            "Ketik atau kirim media apa pun di sini, akan kuteruskan ke Currathor.\n"
+            "Kapan pun kau ingin berhenti, gunakan /stoptalk."
+        )
+        return
+
+async def cancel_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cancel(update, context)
+
+# Handler teks untuk mode menu (menfess/kritik)
+async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mode = context.user_data.get("menu_mode")
+    if not mode:
+        return
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("Pesannya kosong.")
+        return
+    if mode == "kritik":
+        header = "📫  … Kritik dan Saran: 𝙉𝙊𝙏𝙄𝙁𝙄𝘾𝘼𝙏𝙄𝙊𝙉 𝙃𝘼𝙎 𝘼𝙍𝙍𝙄𝙑𝙀𝘿 !"
+        payload = f"{header}\n\n{text}"
+        if await _send_public_safe(context, payload, reply_to=update.message):
+            await update.message.reply_text("Terima kasih, masukanmu telah diteruskan.")
+            context.user_data.pop("menu_mode", None)
+        return
+    if mode == "menfess":
+        header = "📫  … Menfess: 𝙉𝙊𝙏𝙄𝙁𝙄𝘾𝘼𝙏𝙄𝙊𝙉 𝙃𝘼𝙎 𝘼𝙍𝙍𝙄𝙑𝙀𝘿 !"
+        payload = f"{header}\n\n{text}"
+        if await _send_public_safe(context, payload, reply_to=update.message):
+            await update.message.reply_text("Menfess kamu sudah dikirim.")
+            context.user_data.pop("menu_mode", None)
+        return
+
+# ----------------- ADMIN COMMANDS -----------------
+# === Registration toggles & Event form ===
+async def regopen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_currathor(update.effective_user):
+        await update.message.reply_text("❌ Hanya Currathor.")
+        return
+    if not context.args:
+        await update.message.reply_text("Format: /regopen <calon|pengurus|media|sponsor|event>")
+        return
+    key = context.args[0].lower()
+    alias = {"calon":"calon_pelajar","media":"media_partner","sponsor":"sponsorship"}
+    key = alias.get(key, key)
+    if key not in REG_OPEN_FLAGS:
+        await update.message.reply_text("Jenis tidak dikenal.")
+        return
+    REG_OPEN_FLAGS[key] = True
+    save_state()
+    await update.message.reply_text(f"✅ {_reg_label(key)} dibuka.")
+
+async def regclose(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_currathor(update.effective_user):
+        await update.message.reply_text("❌ Hanya Currathor.")
+        return
+    if not context.args:
+        await update.message.reply_text("Format: /regclose <calon|pengurus|media|sponsor|event>")
+        return
+    key = context.args[0].lower()
+    alias = {"calon":"calon_pelajar","media":"media_partner","sponsor":"sponsorship"}
+    key = alias.get(key, key)
+    if key not in REG_OPEN_FLAGS:
+        await update.message.reply_text("Jenis tidak dikenal.")
+        return
+    REG_OPEN_FLAGS[key] = False
+    save_state()
+    await update.message.reply_text(f"🛑 {_reg_label(key)} ditutup.")
+
+async def seteventform(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set format pendaftaran event. Lebih enak: reply ke pesan berisi format multi-baris, lalu /seteventform"""
+    global EVENT_REG_FORM
+    if not _is_currathor(update.effective_user):
+        await update.message.reply_text("❌ Hanya Currathor.")
+        return
+    src = update.message
+    # prioritas: teks dari reply
+    if src.reply_to_message and (src.reply_to_message.text or src.reply_to_message.caption):
+        new_text = (src.reply_to_message.text or src.reply_to_message.caption).strip()
+    else:
+        # ambil semua teks setelah nama command, biar newline (jika ada) tetap ikut
+        full = src.text or ""
+        parts = full.split(maxsplit=1)
+        new_text = parts[1].strip() if len(parts) > 1 else ""
+    if not new_text:
+        await update.message.reply_text(
+            "Format: balas (reply) pesan berisi format, lalu kirim /seteventform\n"
+            "Atau: /seteventform <teks singkat>"
+        )
+        return
+    EVENT_REG_FORM = new_text
+    save_state()
+    await update.message.reply_text("✅ Format pendaftaran event diperbarui.")
+
+async def previeweventform(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_currathor(update.effective_user):
+        await update.message.reply_text("❌ Hanya Currathor.")
+        return
+    await update.message.reply_text(EVENT_REG_FORM or "(belum diset)")
+
+async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    if (caller.username or "").lower() != OWNER_USERNAME.lower():
+        await update.message.reply_text("Hanya Dei yang bisa menambahkan Currathor.")
+        return
+    if not context.args:
+        await update.message.reply_text("Format: /addadmin <ACCOUNT_NUMBER>")
+        return
+    acc_no = context.args[0]
+    if not acc_no.isdigit():
+        await update.message.reply_text("Nomor akun harus berupa angka (contoh: 1, 2, 3).")
+        return
+    uid = ACCOUNT_INDEX.get(acc_no)
+    if not uid:
+        await update.message.reply_text("Account Number tidak ditemukan.")
+        return
+    target_id = int(uid)
+    if target_id in admin_ids:
+        try:
+            u = await context.bot.get_chat(target_id)
+            await update.message.reply_html(f"{u.mention_html()} (Acc:{acc_no}) sudah menjadi Currathor.")
+        except Exception:
+            await update.message.reply_html(f"(Acc:{acc_no}) sudah menjadi Currathor.")
+        return
+    admin_ids.add(target_id); save_state()
+    try:
+        u = await context.bot.get_chat(target_id)
+        label = u.mention_html()
+    except Exception:
+        label = f"<code>uid:{target_id}</code>"
+    await update.message.reply_html(f"✅ {label} (Acc:{acc_no}) ditambahkan sebagai <b>Currathor</b>.")
+
+async def del_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    if (caller.username or "").lower() != OWNER_USERNAME.lower():
+        await update.message.reply_text("Hanya Dei yang bisa mencabut Currathor.")
+        return
+    if not context.args:
+        await update.message.reply_text("Format: /deladmin <ACCOUNT_NUMBER>")
+        return
+    acc_no = context.args[0]
+    if not acc_no.isdigit():
+        await update.message.reply_text("Nomor akun harus berupa angka.")
+        return
+    uid = ACCOUNT_INDEX.get(acc_no)
+    if not uid:
+        await update.message.reply_text("Account Number tidak ditemukan.")
+        return
+    target_id = int(uid)
+    if target_id not in admin_ids:
+        await update.message.reply_text("Ia bukan Currathor.")
+        return
+    admin_ids.discard(target_id); save_state()
+    try:
+        u = await context.bot.get_chat(target_id)
+        label = u.mention_html()
+    except Exception:
+        label = f"<code>uid:{target_id}</code>"
+    await update.message.reply_html(f"🗑️ {label} (Acc:{acc_no}) dicabut dari <b>Currathor</b>.")
+
+async def list_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    is_owner = (caller.username or "").lower() == OWNER_USERNAME.lower()
+    if not is_owner:
+        await update.message.reply_text("Hanya Owner.")
+        return
+    if not admin_ids:
+        await update.message.reply_text("(Belum ada Currathor).")
+        return
+    lines = ["⟢ Currathor:"]
+    for uid in sorted(admin_ids):
+        try:
+            ch = await context.bot.get_chat(uid)
+            label = ch.mention_html()
+        except Exception:
+            label = f"<code>uid:{uid}</code>"
+        acc_no = ACCOUNTS.get(str(uid), {}).get("acc_no", "-")
+        lines.append(f"- {label} (Acc:{acc_no})")
+    await update.message.reply_html("\n".join(lines))
+
+# ---------- MEMBERLIST ----------
+async def memberlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not ((user.username or "").lower() == OWNER_USERNAME.lower() or user.id in admin_ids):
+        await update.message.reply_text("Hanya Currathor/Owner.")
+        return
+
+    if not ACCOUNTS:
+        await update.message.reply_text("Belum ada persona terdaftar.")
+        return
+
+    rows = []
+    for uid_str, rec in sorted(ACCOUNTS.items(), key=lambda kv: kv[1].get("acc_no", 0)):
+        acc = rec.get("acc_no", "-")
+        name = rec.get("name", "-")
+        pilar = rec.get("pilar", "-")
+        try:
+            u = await context.bot.get_chat(int(uid_str))
+            usn = f"@{u.username}" if u.username else "-"
+        except Exception:
+            usn = "-"
+        rows.append(f"O{int(acc):02d}. {name} — {usn} — {pilar}")
+
+    for chunk in _chunk_lines(rows, max_chars=3500):
+        await update.message.reply_text(chunk if chunk.strip() else "(kosong)")
+
+# ---------- RESET ACCOUNT & RESET ROLL ATTRIBUTE ----------
+async def resetacc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    is_owner = (caller.username or "").lower() == OWNER_USERNAME.lower()
+    is_admin = caller.id in admin_ids
+    if not (is_owner or is_admin):
+        await update.message.reply_text("Hanya Currathor yang boleh mereset akun.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Format: /resetacc <ACCOUNT_NUMBER>")
+        return
+
+    acc_no = context.args[0]
+    if not acc_no.isdigit():
+        await update.message.reply_text("Nomor akun harus berupa angka (contoh: 1, 2, 3).")
+        return
+
+    uid_str = ACCOUNT_INDEX.get(acc_no)
+    if not uid_str:
+        await update.message.reply_text("Account Number tidak ditemukan.")
+        return
+
+    # --- bersih-bersih semua data user ---
+    # simpan record dulu (buat hapus file idc jika ada)
+    rec = ACCOUNTS.get(uid_str, {})
+
+    # hapus file ID Card manual jika ada
+    try:
+        idc_path = rec.get("idc_custom_png")
+        if idc_path:
+            p = Path(idc_path)
+            if p.exists():
+                p.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    # hapus akun & index
+    ACCOUNT_INDEX.pop(acc_no, None)
+    ACCOUNTS.pop(uid_str, None)
+
+    # kembalikan nomor ke pool (hindari duplikat)
+    try:
+        freed_no = int(acc_no)
+        if freed_no not in FREED_NUMBERS:
+            FREED_NUMBERS.append(freed_no)
+    except Exception:
+        pass
+
+    # hapus atribut hasil /rollatr
+    try:
+        uid_int = int(uid_str)
+    except Exception:
+        uid_int = None
+
+    if uid_int is not None:
+        user_rolls.pop(uid_int, None)
+        user_stats.pop(uid_int, None)
+
+        # hapus raport (aktif & dungeon point)
+        RAPORT.pop(str(uid_int), None)
+
+        # cabut role jika ada (biar benar-benar kosong)
+        admin_ids.discard(uid_int)
+        PROFESSORS.discard(uid_int)
+
+    # simpan perubahan
+    save_accounts()
+    save_raport()
+    save_state()
+
+    await update.message.reply_text(f"Telah terhapus dari prasasti beserta seluruh jejaknya: persona {acc_no}")
+
+# ---------- Resolve target by reply/@ ----------
+async def _resolve_target_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return None, None
+
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        u = msg.reply_to_message.from_user
+        return u.id, u.mention_html()
+
+    text = msg.text or ""
+    entities = msg.entities or []
+    for ent in entities:
+        if ent.type == MessageEntityType.TEXT_MENTION and ent.user:
+            return ent.user.id, ent.user.mention_html()
+        if ent.type == MessageEntityType.MENTION:
+            username = text[ent.offset: ent.offset + ent.length]
+            try:
+                chat_obj = await context.bot.get_chat(username)
+                return chat_obj.id, username
+            except Exception:
+                return None, username
+    return None, None
+
+async def resetatr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    target_id, target_label = await _resolve_target_user_id(update, context)
+    if target_id is None and not context.args:
+        target_id = caller.id; target_label = caller.mention_html()
+    elif target_id is None and context.args:
+        bad = context.args[0]
+        await update.message.reply_html(
+            f"ⓘ | Tak kutemukan sosok bernama <b>{bad}</b>.\n"
+            f"Namun ada jalan-jalan yang dapat kau tempuh:\n"
+            f"₊⊹ Balaslah pesan miliknya, lalu bisikkan <code>/resetatr</code>\n"
+            f"₊⊹ Pastikan ia bertanda nama di muka publik, lalu gunakan <code>/resetatr @username</code>\n"
+            f"₊⊹ Mintalah ia menyapa bot ini dengan <code>/start</code>, agar keberadaannya terpatri\n"
+            f"₊⊹ Atau ukirlah dengan <code>/resetatr &lt;user_id&gt;</code> — angka murni penanda dirinya"
+        )
+        return
+    is_owner = _is_owner(caller)
+    is_admin = caller.id in admin_ids
+    if target_id != caller.id and not (is_owner or is_admin):
+        await update.message.reply_html("ⓘ | Hanya Currathor yang boleh mereset atribut pengguna lain.")
+        return
+    user_rolls.pop(target_id, None)
+    user_stats.pop(target_id, None)
+    if target_id == caller.id:
+        await update.message.reply_html("ⓘ | Tapak Atributmu dikosongkan, lembar baru kini terbentang.")
+    else:
+        await update.message.reply_html(f"ⓘ | Tapak Atribut milik {target_label} telah dikosongkan.")
+
+# ---------- PROFESSOR COMMAND ----------
+async def setprof(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    is_owner = (caller.username or "").lower() == OWNER_USERNAME.lower()
+    is_admin = caller.id in admin_ids
+    if not (is_owner or is_admin):
+        await update.message.reply_text("Hanya Currathor yang dapat mengatur Professor.")
+        return
+    if not context.args:
+        await update.message.reply_text("Format: /setprof <ACCOUNT_NUMBER>")
+        return
+    acc_no = context.args[0]
+    if not acc_no.isdigit():
+        await update.message.reply_text("Nomor akun harus berupa angka (contoh: 1, 2, 3).")
+        return
+    uid = ACCOUNT_INDEX.get(acc_no)
+    if not uid:
+        await update.message.reply_text("Account Number tidak ditemukan.")
+        return
+    target_id = int(uid)
+    if target_id in PROFESSORS:
+        try:
+            u = await context.bot.get_chat(target_id)
+            label = u.mention_html()
+        except Exception:
+            label = f"<code>Acc:{acc_no}</code>"
+        await update.message.reply_html(f"ⓘ {label} (Acc:{acc_no}) sudah berstatus <b>Professor</b>.")
+        return
+    PROFESSORS.add(target_id)
+    save_accounts()
+    try:
+        u = await context.bot.get_chat(target_id)
+        label = u.mention_html()
+    except Exception:
+        label = f"<code>Acc:{acc_no}</code>"
+    await update.message.reply_html(f"✅ {label} (Acc:{acc_no}) diangkat sebagai <b>Professor</b>.")
+
+async def unsetprof(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    is_owner = (caller.username or "").lower() == OWNER_USERNAME.lower()
+    is_admin = caller.id in admin_ids
+    if not (is_owner or is_admin):
+        await update.message.reply_text("Hanya Currathor yang dapat mengatur Professor.")
+        return
+    if not context.args:
+        await update.message.reply_text("Format: /unsetprof <ACCOUNT_NUMBER>")
+        return
+    acc_no = context.args[0]
+    if not acc_no.isdigit():
+        await update.message.reply_text("Nomor akun harus berupa angka (contoh: 1, 2, 3).")
+        return
+    uid = ACCOUNT_INDEX.get(acc_no)
+    if not uid:
+        await update.message.reply_text("Account Number tidak ditemukan.")
+        return
+    target_id = int(uid)
+    if target_id not in PROFESSORS:
+        try:
+            u = await context.bot.get_chat(target_id)
+            label = u.mention_html()
+        except Exception:
+            label = f"<code>Acc:{acc_no}</code>"
+        await update.message.reply_html(f"ⓘ {label} (Acc:{acc_no}) bukan Professor.")
+        return
+    PROFESSORS.discard(target_id)
+    save_accounts()
+    try:
+        u = await context.bot.get_chat(target_id)
+        label = u.mention_html()
+    except Exception:
+        label = f"<code>Acc:{acc_no}</code>"
+    await update.message.reply_html(f"🗑️ {label} (Acc:{acc_no}) dicabut dari <b>Professor</b>.")
+
+# ---------- REGISTRATION ----------
+async def registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def btn_text(kind):
+        base = _reg_label(kind)
+        return f"{base} (Tutup)" if not _is_reg_open(kind) else base
+
+    keyboard = [
+        [InlineKeyboardButton("Calon Pelajar Eryndale", callback_data="calon_pelajar")],
+        [InlineKeyboardButton("Pengurus Eryndale", callback_data="pengurus")],
+        [InlineKeyboardButton("Media Partner", callback_data="media_partner")],
+        [InlineKeyboardButton("Sponsorship", callback_data="sponsorship")],
+        [InlineKeyboardButton(btn_text("event"), callback_data="event")],
+    ]
+    await update.message.reply_text(
+        "𖠷 ╱.. ᴇʀʏɴᴅᴀʟᴇ ʀᴇɢɪsᴛʀᴀᴛɪᴏɴ — ⓘ\n\n"
+        "Salam. Boleh kutanya sebagai apa kiranya kau hendak menjejakkan langkah di Institusi Eryndale?",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return CHOOSING
+
+async def registration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    reg_type = query.data  # salah satu dari keys kita
+
+    label = _reg_label(reg_type)
+    if not _is_reg_open(reg_type):
+        await query.edit_message_text(f"ⓘ Saat ini kami tidak membuka {label.lower()}.")
+        return ConversationHandler.END
+
+    context.user_data["registration_type"] = reg_type
+
+    if reg_type == "calon_pelajar":
+        form_text = (
+            "Sila isi perihal data diri yang tersedia, lalu titipkan kembali padaku.\n\n"
+            "⌜𝐂𝐚𝐥𝐨𝐧 𝐏𝐞𝐥𝐚𝐣𝐚𝐫  𝐄𝐫𝐲𝐧𝐝𝐚𝐥𝐞⌟\n"
+            "▸ Nama Lengkap :\n"
+            "▸ Username :\n"
+            "▸ Pilihan Pilar :"
+        )
+    elif reg_type == "pengurus":
+        form_text = (
+            "Sila isi perihal data diri yang tersedia, lalu titipkan kembali padaku.\n\n"
+            "⌜𝐏𝐞𝐧𝐠𝐮𝐫𝐮𝐬  𝐄𝐫𝐲𝐧𝐝𝐚𝐥𝐞⌟\n"
+            "▸ Nama Lengkap :\n"
+            "▸ Username :\n"
+            "▸ Pilihan Jabatan :"
+        )
+    elif reg_type == "media_partner":
+        form_text = (
+            "Sila isi perihal data diri yang tersedia, lalu titipkan kembali padaku.\n\n"
+            "⌜𝐌𝐞𝐝𝐢𝐚 𝐏𝐚𝐫𝐭𝐧𝐞𝐫⌟\n"
+            "▸ Nama Instansi :\n"
+            "▸ Link Channel/Fanpage :\n"
+            "▸ Link Logo Instansi :\n"
+            "▸ Perwakilan :\n"
+            "  ①. Nama + Username\n"
+            "  ②. Nama + Username"
+        )
+    elif reg_type == "sponsorship":
+        form_text = (
+            "Sila isi perihal data diri yang tersedia, lalu titipkan kembali padaku.\n\n"
+            "⌜𝐒𝐩𝐨𝐧𝐬𝐨𝐫𝐬𝐡𝐢𝐩⌟\n"
+            "▸ Nama Instansi :\n"
+            "▸ Pilihan Sponsorship :\n"
+            "▸ Link Channel/Fanpage :\n"
+            "▸ Link Logo Instansi :\n"
+            "▸ Perwakilan :\n"
+            "  ①. Nama + Username\n"
+            "  ②. Nama + Username"
+        )
+    else:  # "event"
+        form_text = EVENT_REG_FORM or "Belum ada format pendaftaran event yang diset oleh admin."
+
+    await query.edit_message_text(form_text)
+    return TYPING
+
+async def registration_submit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    context.user_data["form_data"] = user_text
+    keyboard = [
+        [InlineKeyboardButton("☑ Sudah benar", callback_data="confirm")],
+        [InlineKeyboardButton("☒ Masih ada yang salah", callback_data="cancel")]
+    ]
+    await update.message.reply_text(
+        f"Apakah data berikut sudah benar?\n\n{user_text}",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return CONFIRM
+
+async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data
+    if choice == "confirm":
+        reg_type = context.user_data.get("registration_type", "unknown")
+        label = _reg_label(reg_type)
+        form_data = context.user_data.get("form_data", "")
+
+        forward_text = (
+            f"ⓘ ► 𝖯𝗈𝗉-𝗎𝗉: 𝙉𝙊𝙏𝙄𝙁𝙄𝘾𝘼𝙏𝙄𝙊𝙉 𝙃𝘼𝙎 𝘼𝙍𝙍𝙄𝙑𝙀𝘿 ! ({label})\n\n"
+            f"{form_data}\n\n"
+            f"Dari: @{query.from_user.username or query.from_user.id}"
+        )
+        # pengurus -> STAFF; lainnya (termasuk event) -> PUBLIC
+        target_chat = FORWARD_STAFFTALK_CHAT_ID if reg_type == "pengurus" else FORWARD_PUBLIC_CHAT_ID
+        if target_chat == FORWARD_PUBLIC_CHAT_ID:
+            await _send_public_safe(context, forward_text)
+        else:
+            await _send_stafftalk_safe(context, forward_text)
+
+        await query.edit_message_text(
+            "ⓘ ► 𝖯𝗈𝗉-𝗎𝗉: 𝙉𝙊𝙏𝙄𝙁𝙄𝘾𝘼𝙏𝙄𝙊𝙉 𝙃𝘼𝙎 𝘼𝙍𝙍𝙄𝙑𝙀𝘿 !\n"
+            ".. Data dirimu telah kami terima. Bilamana waktunya telah tiba, kabar akan kami kirimkan padamu .”\n\n"
+            "Dengan Hormat, 𝐅𝐢𝐞́𝐫𝐭𝐞—𝐦𝐚𝐢𝐝𝐞𝐧 𝐨𝐟 𝐄𝐫𝐲𝐧𝐝𝐚𝐥𝐞 ♡."
+        )
+        return ConversationHandler.END
+
+    elif choice == "cancel":
+        await query.edit_message_text("ⓘ Jejakmu terhapus, isi kembali agar tercatat.")
+        return TYPING
+
+
+# ======== CLASS ATTENDANCE (UNIVERSAL) ========
+async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    args = [a.lower() for a in (context.args or [])]
+    if not args or args[0] != "class" or len(args) < 2:
+        await update.message.reply_text("Format: /open class <battle|riddle|elemental>")
+        return
+    subject = args[1]
+    if subject not in ("battle", "riddle", "elemental"):
+        await update.message.reply_text("Bisikkan mantra /open class <battle|riddle|elemental>")
+        return
+    if not _is_privileged(caller):
+        await update.message.reply_text("ⓘ Kelas terkunci; kuasa membukanya hanyalah milik Currathor, dan Professor.")
+        return
+    chat_id = update.effective_chat.id
+    if str(chat_id) in BCLASS_ACTIVE:
+        await update.message.reply_text("ⓘ Masih ada sesi aktif. Tutup dulu dengan /close class.")
+        return
+    opened_at = datetime.now()
+    date_str = opened_at.strftime("%d/%m/%Y")
+    subj_title = subject.capitalize()
+    kb = [[InlineKeyboardButton("Hadir", callback_data="bclass:attend:HADIR"),
+           InlineKeyboardButton("Izin",  callback_data="bclass:attend:IZIN")]]
+    sent = await update.message.reply_text(
+        f"‧₊˚ ┊ {subj_title} telah dibuka.\nTanggal: {date_str}\n\nTinggalkan tanda hadir atau tiada:",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+    BCLASS_ACTIVE[str(chat_id)] = {
+        "opened_at": opened_at.strftime("%Y-%m-%d %H:%M:%S"),
+        "message_id": sent.message_id,
+        "subject": subject,
+        "responses": {},
+    }
+    save_bclass()
+
+async def bclass_attend_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    user = q.from_user
+    chat_id = q.message.chat.id
+    active = BCLASS_ACTIVE.get(str(chat_id))
+    if not active or q.message.message_id != active.get("message_id"):
+        await q.answer("Sesi tidak aktif.", show_alert=True)
+        return
+    data = q.data or ""
+    try:
+        _, _, status = data.split(":")
+    except Exception:
+        await q.answer("Data tidak valid.", show_alert=True)
+        return
+    status = status.upper()
+    if status not in ("HADIR", "IZIN"):
+        await q.answer("Status tidak dikenali.", show_alert=True)
+        return
+    uid_key = str(user.id)
+    prev = active.get("responses", {}).get(uid_key)
+    hhmm = datetime.now().strftime("%H:%M")
+    active.setdefault("responses", {})[uid_key] = {"status": status, "time": hhmm}
+    save_bclass()
+    if status == "HADIR":
+        msg = f"Kau hadir di ruang ajar, ketika jarum waktu menunjuk: ({hhmm})." if not prev else f"Absensimu diperbarui; hadirmu kini tercatat pada kala: ({hhmm})."
+    else:
+        msg = "Langkahmu tercatat sebagai izin dari kelas." if not prev else "Absensimu diperbarui; kau berizin dari kelas"
+    await q.answer(msg, show_alert=True)
+
+async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    if not _is_privileged(caller):
+        await update.message.reply_text("ⓘ Hanya Currathor dan Professor yang dapat menutup kelas.")
+        return
+    chat_id = update.effective_chat.id
+    active = BCLASS_ACTIVE.get(str(chat_id))
+    if not active:
+        await update.message.reply_text("Tidak ada sesi aktif untuk ditutup.")
+        return
+    try:
+        opened_at = datetime.strptime(active["opened_at"], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        opened_at = datetime.now()
+    date_str = opened_at.strftime("%d/%m/%Y")
+    subject = active.get("subject", "elemental")
+    subj_title = subject.capitalize()
+    responses = active.get("responses", {})
+
+    # Siapkan daftar anggota (hanya students yang eligible)
+    rows_struct = []
+    members = []
+    for uid_str, rec in ACCOUNTS.items():
+        acc_no = int(rec.get("acc_no", 0) or 0)
+        name = rec.get("name", "-")
+        pilar = rec.get("pilar", "-")
+        members.append((acc_no, int(uid_str), name, pilar))
+    members.sort(key=lambda x: x[0])
+
+    for acc_no, uid, name, pilar in members:
+        try:
+            u = await context.bot.get_chat(uid)
+            username = f"@{u.username}" if u.username else "-"
+            is_student = _is_student(uid, u.username)
+        except Exception:
+            username = "-"
+            is_student = _is_student(uid, None)
+        if not is_student:
+            continue
+        if not _eligible_for_class(pilar, subject):
+            continue
+        rec_resp = responses.get(str(uid))
+        if not rec_resp:
+            result = "alpha"
+        else:
+            result = rec_resp.get("time", "-") if rec_resp["status"] == "HADIR" else "izin"
+        rows_struct.append({"uid": uid, "name": name, "username": username, "result": result})
+
+    ch_key = str(chat_id)
+    BCLASS_HISTORY.setdefault(ch_key, {})
+    entry = {"subject": subject, "taken_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "rows": rows_struct}
+    BCLASS_HISTORY[ch_key].setdefault(date_str, []).append(entry)
+    BCLASS_ACTIVE.pop(ch_key, None)
+    save_bclass()
+
+    lines = [f"Tanggal: {date_str} — Kelas: {subj_title}", ""]
+    if rows_struct:
+        for i, row in enumerate(rows_struct, start=1):
+            lines.append(f"O{i:02d}. {row['username']} : {row['name']} ─ {row['result']}")
+    else:
+        lines.append("— (Tiada nama yang tergurat dalam rekap.)")
+
+    for chunk in _chunk_lines(lines):
+        await update.message.reply_text(chunk)
+    await update.message.reply_text("‧₊˚ ┊ Kelas ditutup, jejak rekapan tersimpan.")
+
+    # Auto-beri nilai aktif 60 untuk hadir (izin/alpha = 0)
+    try:
+        for row in rows_struct:
+            uid = int(row["uid"])
+            res = str(row.get("result", "")).lower()
+            score = 0 if res in ("izin", "alpha") else 60
+            _raport_add_active(uid, score)
+        save_raport()
+    except Exception as e:
+        print(f"[WARN] add active score failed: {e}")
+
+async def rekap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    if not _is_privileged(caller):
+        await update.message.reply_text("Belum berwenang.")
+        return
+    args = [a.lower() for a in (context.args or [])]
+    if not args or args[0] != "class":
+        await update.message.reply_text("Format: /rekap class [battle|riddle|elemental]")
+        return
+    subject_filter = None
+    if len(args) >= 2 and args[1] in ("battle", "riddle", "elemental"):
+        subject_filter = args[1]
+    chat_id = update.effective_chat.id
+    ch_hist = BCLASS_HISTORY.get(str(chat_id), {})
+    if not ch_hist:
+        await update.message.reply_text("Belum ada data rekap tersimpan untuk chat ini.")
+        return
+
+    def _parse_ddmmyyyy(s: str):
+        try:
+            return datetime.strptime(s, "%d/%m/%Y")
+        except Exception:
+            return datetime.min
+
+    lines = []
+    for date_str in sorted(ch_hist.keys(), key=_parse_ddmmyyyy):
+        entries = ch_hist[date_str] if isinstance(ch_hist[date_str], list) else [ch_hist[date_str]]
+        if subject_filter:
+            entries = [e for e in entries if e.get("subject") == subject_filter]
+        if not entries:
+            continue
+        for entry in entries:
+            subj_title = entry.get("subject", "elemental").capitalize()
+            rows = entry.get("rows", [])
+            lines.append(f"Tanggal: {date_str} — Kelas: {subj_title}\n")
+            if rows:
+                for i, row in enumerate(rows, start=1):
+                    lines.append(f"O{i:02d}. {row['username']} : {row['name']} ─ {row['result']}")
+            else:
+                lines.append("— (tidak ada peserta yang direkap)")
+            lines.append("")
+    if not lines:
+        msg = f"Tidak ada rekap untuk kelas {subject_filter.capitalize()} di chat ini." if subject_filter else "Belum ada data rekap yang bisa ditampilkan."
+        await update.message.reply_text(msg)
+    else:
+        for chunk in _chunk_lines(lines):
+            await update.message.reply_text(chunk)
+
+# ============== EXPEDITION ==============
+EXPEDITION_FILE = os.getenv("FIERTE_EXPEDITION", "fierte_expedition.json")
+EXPEDITION_ACTIVE = {}
+
+def save_expedition():
+    try:
+        with open(EXPEDITION_FILE, "w", encoding="utf-8") as f:
+            json.dump({"active": EXPEDITION_ACTIVE}, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[WARN] save_expedition failed: {e}")
+
+def load_expedition():
+    global EXPEDITION_ACTIVE
+    try:
+        p = Path(EXPEDITION_FILE)
+        if not p.exists():
+            return
+        with p.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        EXPEDITION_ACTIVE = data.get("active", {})
+        print(f"[INFO] Expedition loaded: active={len(EXPEDITION_ACTIVE)}")
+    except Exception as e:
+        print(f"[WARN] load_expedition failed: {e}")
+
+async def expedition_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    if not _is_privileged(caller):
+        await update.message.reply_text("❌ Hanya Owner/Currathor/Professor.")
+        return
+    chat_id = str(update.effective_chat.id)
+    if chat_id in EXPEDITION_ACTIVE:
+        await update.message.reply_text("⚠️ Expedition masih aktif. Tutup dulu.")
+        return
+    kb = [[InlineKeyboardButton("🧭 Join Expedition", callback_data="expedition:join")]]
+    sent = await update.message.reply_text("⛺️ Expedition dibuka! Klik untuk bergabung:", reply_markup=InlineKeyboardMarkup(kb))
+    EXPEDITION_ACTIVE[chat_id] = {
+        "opened_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "message_id": sent.message_id,
+        "members": []
+    }
+    save_expedition()
+
+async def expedition_join_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    chat_id = str(q.message.chat.id)
+    sess = EXPEDITION_ACTIVE.get(chat_id)
+    if not sess or q.message.message_id != sess.get("message_id"):
+        await q.answer("Sesi expedition tidak aktif.", show_alert=True)
+        return
+    uid = q.from_user.id
+    members = set(int(x) for x in sess.get("members", []))
+    if uid in members:
+        await q.answer("Kamu sudah join.", show_alert=True)
+        return
+    members.add(uid); sess["members"] = list(members)
+    save_expedition()
+    await q.answer("Berhasil join Expedition!", show_alert=True)
+
+async def expedition_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    if not _is_privileged(caller):
+        await update.message.reply_text("❌ Hanya Owner/Currathor/Professor.")
+        return
+    chat_id = str(update.effective_chat.id)
+    sess = EXPEDITION_ACTIVE.get(chat_id)
+    if not sess:
+        await update.message.reply_text("Tidak ada expedition aktif.")
+        return
+    members = [int(x) for x in sess.get("members", [])]
+    if not members:
+        await update.message.reply_text("Expedition ditutup. Tidak ada peserta.")
+        EXPEDITION_ACTIVE.pop(chat_id, None); save_expedition()
+        return
+    granted_lines = []
+    for uid in members:
+        try:
+            _raport_grant_dungeon(uid)
+        except NameError:
+            pass
+        try:
+            u = await context.bot.get_chat(uid)
+            label = f"@{u.username}" if u.username else ACCOUNTS.get(str(uid),{}).get("name", str(uid))
+        except Exception:
+            label = ACCOUNTS.get(str(uid),{}).get("name", str(uid))
+        granted_lines.append(f"• {label}")
+    try:
+        save_raport()
+    except NameError:
+        pass
+    report = "🛡️ Peserta Expedition (mendapat 10 poin):\n" + "\n".join(granted_lines)
+    await _send_public_safe(context, report, reply_to=update.message)
+    EXPEDITION_ACTIVE.pop(chat_id, None); save_expedition()
+    await update.message.reply_text("✅ Expedition ditutup & poin diberikan (maks 10).")
+
+async def expedition_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = [a.lower() for a in (context.args or [])]
+    if not args or args[0] not in ("open", "close"):
+        await update.message.reply_text("Format: /expedition <open|close>")
+        return
+    if args[0] == "open":
+        await expedition_open(update, context)
+    else:
+        await expedition_close(update, context)
+
+# ============== FIERTE TALK (Livegram-style) ==============
+def _talk_is_on(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return bool(context.user_data.get("talk_mode"))
+
+async def start_talk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["talk_mode"] = True
+    await update.message.reply_text(
+        "🎧  Fierte Talk aktif. Kirimkan pesanmu; akan kuteruskan ke Currathor.\n"
+        "Admin cukup membalas (reply) di grup. /stoptalk untuk keluar."
+    )
+
+async def stop_talk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.pop("talk_mode", None):
+        await update.message.reply_text("🔕 Fierte Talk dimatikan.")
+    else:
+        return
+
+async def talk_user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _talk_is_on(context):
+        return
+    if not FORWARD_STAFFTALK_CHAT_ID:
+        try:
+            await update.effective_message.reply_text(
+                "Fierte Talk belum diset. Jalankan /setforward_stafftalk_here di grup tujuan (oleh Owner)."
+            )
+        except Exception:
+            pass
+        return
+    msg = update.effective_message
+    user = update.effective_user
+    uid = user.id
+    usn = f"@{user.username}" if user.username else user.first_name
+    header = f"🗣️ From {usn} (uid:{uid})"
+    try:
+        hdr = await context.bot.send_message(
+            chat_id=FORWARD_STAFFTALK_CHAT_ID,
+            text=header
+        )
+        talk_map[(FORWARD_STAFFTALK_CHAT_ID, hdr.message_id)] = uid
+        fwd = await context.bot.forward_message(
+            chat_id=FORWARD_STAFFTALK_CHAT_ID,
+            from_chat_id=msg.chat_id,
+            message_id=msg.message_id
+        )
+        talk_map[(FORWARD_STAFFTALK_CHAT_ID, fwd.message_id)] = uid
+        save_state()
+    except Exception as e:
+        print(f"[talk_user_router] error: {e}")
+        try:
+            await msg.reply_text("❌ Maaf, pesanmu gagal diteruskan.")
+        except Exception:
+            pass
+
+async def talk_admin_reply_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat_id = update.effective_chat.id
+    if chat_id not in (FORWARD_PUBLIC_CHAT_ID, FORWARD_STAFFTALK_CHAT_ID):
+        return
+    if not msg or not msg.reply_to_message:
+        return
+    reply_src = msg.reply_to_message
+    target_uid = None
+    if getattr(reply_src, "forward_from", None):
+        try:
+            target_uid = reply_src.forward_from.id
+        except Exception:
+            target_uid = None
+    if target_uid is None:
+        target_uid = talk_map.get((chat_id, reply_src.message_id))
+    if target_uid is None:
+        txt = (reply_src.text or reply_src.caption or "")
+        m = re.search(r'uid\s*:\s*(\d+)', txt)
+        if m:
+            try:
+                target_uid = int(m.group(1))
+            except Exception:
+                target_uid = None
+    if target_uid is None:
+        return
+    try:
+        await context.bot.copy_message(
+            chat_id=target_uid,
+            from_chat_id=msg.chat_id,
+            message_id=msg.message_id
+        )
+    except Forbidden as e:
+        print(f"[talk_admin_reply_router] Forbidden to DM user {target_uid}: {e}")
+    except Exception as e:
+        print(f"[talk_admin_reply_router] error: {e}")
+
+# ---------- SET TARGET FORWARD VIA COMMAND ----------
+async def setforward_public_here(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update.effective_user):
+        await update.message.reply_text("Hanya Owner.")
+        return
+    global FORWARD_PUBLIC_CHAT_ID
+    FORWARD_PUBLIC_CHAT_ID = update.effective_chat.id
+    save_state()
+    await update.message.reply_text(f"Forward PUBLIC diset ke chat_id {FORWARD_PUBLIC_CHAT_ID}.")
+
+async def setforward_stafftalk_here(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update.effective_user):
+        await update.message.reply_text("Hanya Owner.")
+        return
+    global FORWARD_STAFFTALK_CHAT_ID
+    FORWARD_STAFFTALK_CHAT_ID = update.effective_chat.id
+    save_state()
+    await update.message.reply_text(f"Forward STAFF/TALK diset ke chat_id {FORWARD_STAFFTALK_CHAT_ID}.")
+
+# ---------- CHECK TARGET FORWARD ----------
+async def where_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = ["📡 Forward targets:"]
+
+    pub_id = FORWARD_PUBLIC_CHAT_ID
+    if pub_id:
+        try:
+            ch = await context.bot.get_chat(pub_id)
+            pub_label = ch.title or ch.username or str(pub_id)
+        except Exception:
+            pub_label = str(pub_id)
+        lines.append(f"• PUBLIC: {pub_label} (chat_id: {pub_id})")
+    else:
+        lines.append("• PUBLIC: (belum diset)")
+
+    staff_id = FORWARD_STAFFTALK_CHAT_ID
+    if staff_id:
+        try:
+            ch = await context.bot.get_chat(staff_id)
+            staff_label = ch.title or ch.username or str(staff_id)
+        except Exception:
+            staff_label = str(staff_id)
+        lines.append(f"• STAFF/TALK: {staff_label} (chat_id: {staff_id})")
+    else:
+        lines.append("• STAFF/TALK: (belum diset)")
+
+    await update.message.reply_text("\n".join(lines))
+
+# ---------- TITLE REGISTRY ----------
+def _resolve_target_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return None, ""
+    arg = context.args[0]
+    if arg.isdigit():
+        if arg in ACCOUNT_INDEX:
+            uid = int(ACCOUNT_INDEX[arg]); return uid, f"(Acc:{arg})"
+        try:
+            return int(arg), f"<code>{arg}</code>"
+        except Exception:
+            pass
+    if arg.startswith("@"):
+        return None, arg
+    return None, arg
+
+async def _force_uid_from_arg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid, label = await _resolve_target_user_id(update, context)
+    if uid:
+        return uid, label
+    uid_guess, label_guess = _resolve_target_any(update, context)
+    if isinstance(uid_guess, int):
+        return uid_guess, label_guess
+    try:
+        chat_obj = await context.bot.get_chat(label_guess)
+        return chat_obj.id, label_guess
+    except Exception:
+        return None, label_guess
+
+async def title_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    if not _is_currathor(caller):
+        await update.message.reply_text("❌ Hanya Currathor.")
+        return
+    if not context.args:
+        await update.message.reply_text("Format: /createtitle <nama title>")
+        return
+    name = " ".join(context.args).strip()
+    if not name:
+        await update.message.reply_text("Nama title tak boleh kosong.")
+        return
+    tid = _next_title_id()
+    TITLES[str(tid)] = {"name": name}
+    save_titles()
+    await update.message.reply_text(f"✅ Title dibuat: [{tid}] {name}")
+
+async def title_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    if not _is_currathor(caller):
+        await update.message.reply_text("❌ Hanya Currathor.")
+        return
+    if not TITLES:
+        await update.message.reply_text("(Belum ada title.)")
+        return
+    lines = ["⟢ Daftar Title:"]
+    for tid in sorted((int(k) for k in TITLES.keys())):
+        lines.append(f"- [{tid}] {TITLES[str(tid)]['name']}")
+    await update.message.reply_text("\n".join(lines))
+
+async def title_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    if not _is_currathor(caller):
+        await update.message.reply_text("❌ Hanya Currathor.")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Format: /deltitle <ID>")
+        return
+
+    tid = int(context.args[0])
+    if str(tid) not in TITLES:
+        await update.message.reply_text("ID title tidak ditemukan.")
+        return
+
+    name = TITLES.pop(str(tid)).get("name", f"(#{tid})")
+
+    for uid_str, rec in ACCOUNTS.items():
+        inv = rec.get("title_inventory_ids", []) or []
+        act = rec.get("active_title_ids", []) or []
+        if tid in inv:
+            rec["title_inventory_ids"] = [x for x in inv if int(x) != tid]
+        if tid in act:
+            rec["active_title_ids"] = [x for x in act if int(x) != tid]
+
+    save_titles()
+    save_accounts()
+    await update.message.reply_text(f"🗑️ Title [{tid}] {name} dihapus & dibersihkan dari inventory pengguna.")
+
+async def title_grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    if not _is_currathor(caller):
+        await update.message.reply_text("❌ Hanya Currathor.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Format: /granttitle <@user|uid|ACC_NO> <ID>")
+        return
+    uid, label = await _force_uid_from_arg(update, context)
+    if uid is None:
+        bad = context.args[0]
+        await update.message.reply_html(f"ⓘ | Target <b>{bad}</b> tidak ditemukan.")
+        return
+    tid_s = context.args[1]
+    if not tid_s.isdigit() or str(tid_s) not in TITLES:
+        await update.message.reply_text("ID title tidak ditemukan.")
+        return
+    tid = int(tid_s)
+    _ensure_account_defaults(uid)
+    inv = ACCOUNTS[str(uid)].setdefault("title_inventory_ids", [])
+    if tid not in inv:
+        inv.append(tid)
+    save_accounts()
+    tname = TITLES[str(tid)]["name"]
+    try:
+        u = await context.bot.get_chat(uid)
+        label = u.mention_html()
+    except Exception:
+        pass
+    await update.message.reply_html(f"✅ {label} diberi title <b>[{tid}] {tname}</b>.")
+
+async def title_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    if not _is_currathor(caller):
+        await update.message.reply_text("❌ Hanya Currathor.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Format: /revoketitle <@user|uid|ACC_NO> <ID>")
+        return
+    uid, label = await _force_uid_from_arg(update, context)
+    if uid is None:
+        bad = context.args[0]
+        await update.message.reply_html(f"ⓘ | Target <b>{bad}</b> tidak ditemukan.")
+        return
+    tid_s = context.args[1]
+    if not tid_s.isdigit():
+        await update.message.reply_text("Format: /revoketitle <@user|uid|ACC_NO> <ID>")
+        return
+    tid = int(tid_s)
+    _ensure_account_defaults(uid)
+    rec = ACCOUNTS[str(uid)]
+    inv = rec.setdefault("title_inventory_ids", [])
+    act = rec.setdefault("active_title_ids", [])
+    changed = False
+    if tid in inv:
+        inv[:] = [x for x in inv if int(x) != tid]
+        changed = True
+    if tid in act:
+        act[:] = [x for x in act if int(x) != tid]
+        changed = True
+    if changed:
+        save_accounts()
+    try:
+        tname = TITLES.get(str(tid), {}).get("name", f"(#{tid})")
+        u = await context.bot.get_chat(uid)
+        label = u.mention_html()
+    except Exception:
+        tname = TITLES.get(str(tid), {}).get("name", f"(#{tid})")
+    await update.message.reply_html(f"🗑️ {label} dicabut title <b>[{tid}] {tname}</b>.")
+
+# ---------- DIVINE BLESS (Add/Moderation) ----------
+async def addskill(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    uid = str(user.id)
+
+    # Wajib punya akun
+    if uid not in ACCOUNTS:
+        await update.message.reply_text("ⓘ Buat persona dulu via /introduction.")
+        return
+
+    rec = ACCOUNTS[uid]
+    # (Opsional) hanya Eridorian
+    if (rec.get("pilar") or "") != "Eridorian":
+        await update.message.reply_text("ⓘ Hanya Eridorian yang dapat mengajukan Divine Bless.")
+        return
+
+    # Ambil payload asli sesudah /addskill — baris baru terjaga
+    payload = _get_command_payload_text(update.message, "/addskill")
+
+    if not payload:
+        await update.message.reply_text(
+            "Format: kirim\n"
+            "addskill <judul & deskripsi>\n\n"
+            "Contoh:\n"
+            "addskill ◈— Curse Devour\n"
+            "★★★★✩\n\n"
+            "Skill ini akan aktif ...\n\n"
+            "Effects:\n"
+            "» ...\n\n"
+            "dur : 3 turn\n"
+            "cd : 5 turn"
+        )
+        return
+
+    # Simpan apa adanya (preserve newline)
+    rec["divine_bless_pending"] = payload
+    save_accounts()
+
+    # Kirim notifikasi ke Currathor (StaffTalk)
+    bubble = build_divine_bless_request_bubble(user, int(uid), rec, payload)
+    ok = await _send_stafftalk_safe(context, bubble, reply_to=update.message)
+    if ok:
+        await update.message.reply_text("✅ Pengajuan Divine Bless diterima. Menunggu keputusan Currathor.")
+    else:
+        await update.message.reply_text("⚠️ Pengajuan tersimpan, namun gagal mengirim notifikasi ke Currathor.")
+
+
+# ---------- DIVINE BLESS: moderasi (Currathor) ----------
+async def divinebless(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    if not _is_currathor(caller):
+        await update.message.reply_text("❌ Hanya Currathor.")
+        return
+
+    if not context.args or context.args[0] not in ("approve", "reject"):
+        await update.message.reply_text("Format: reply ke pengajuan lalu /divinebless <approve|reject>")
+        return
+
+    # Harus reply ke bubble pengajuan (yang memuat '(uid:123)')
+    src = update.message.reply_to_message
+    if not src:
+        await update.message.reply_text("Balas (reply) ke pesan pengajuan lalu ulangi perintah.")
+        return
+
+    src_text = (src.text or src.caption or "")
+    m = re.search(r'\(uid\s*:\s*(\d+)\)', src_text)
+    if not m:
+        await update.message.reply_text("Tidak dapat menemukan uid di pesan yang dibalas.")
+        return
+
+    target_uid = int(m.group(1))
+    rec = ACCOUNTS.get(str(target_uid))
+    if not rec:
+        await update.message.reply_text("Persona target tidak ditemukan.")
+        return
+
+    action = context.args[0]
+    if action == "approve":
+        pending = (rec.get("divine_bless_pending") or "").rstrip()
+        if not pending:
+            await update.message.reply_text("Tidak ada pengajuan pending untuk disetujui.")
+            return
+        # Set sebagai final (tetap dengan baris baru yang sama)
+        rec["divine_bless"] = pending
+        rec["divine_bless_pending"] = None
+        save_accounts()
+
+        # Beri kabar ke user
+        try:
+            await context.bot.send_message(chat_id=target_uid, text=build_divine_bless_approved_bubble(rec))
+        except Exception:
+            pass
+
+        await update.message.reply_text("✅ Disetujui & dikirim ke pengguna.")
+    else:  # reject
+        if rec.get("divine_bless_pending"):
+            rec["divine_bless_pending"] = None
+            save_accounts()
+        await update.message.reply_text("🗑️ Pengajuan ditolak & dibersihkan.")
+
+# ---------- HELP ----------
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    is_owner = (user.username or "").lower() == OWNER_USERNAME.lower()
+    is_admin = (user.id in admin_ids) or is_owner
+
+    umum = [
+        "📖  Bantuan — daftar perintah",
+        "",
+        "• /menu — buka menu utama",
+        "• /introduction — buat persona (akun Eryndale)",
+        "• /changemyacc — ganti nama persona + atur title aktif dari inventory",
+        "• /myinfo — info & ID Card (jika ada)",
+        "• /rollatr — roll set atribut",
+        "• /mystat — lihat atributmu",
+        "• /resetatr [reply/@uid/uid] — reset atribut (tanpa argumen = diri sendiri)",
+        "• /divine <dX|NdX±M> — lempar dadu (contoh: /divine d20, /divine 2d6+3)",
+        "• /registration — formulir pendaftaran (termasuk Pendaftaran Event)",
+        "• /starttalk — mulai Fierte Talk (DM → diteruskan ke Currathor)",
+        "• /stoptalk — hentikan Fierte Talk",
+        "• /addskill <teks> — ajukan Divine Bless (Eridorian; menunggu acc Currathor)",
+        "",
+        "Kelas:",
+        "• /open class <battle|riddle|elemental> — buka absensi",
+        "• /close class — tutup & rekap absensi",
+        "• /rekap class [battle|riddle|elemental] — lihat rekap",
+        "",
+        "Expedition:",
+        "• /expedition open — buka expedition",
+        "• /expedition close — tutup expedition & beri poin",
+        "",
+        "ID Card manual:",
+        "• /setidc — set gambar ID Card (reply ke gambar)",
+        "• /clearidc — hapus ID Card manual",
+    ]
+
+    admin = [
+        "",
+        "Currathor/Owner:",
+        "• /addadmin <ACC_NO> — angkat admin",
+        "• /deladmin <ACC_NO> — cabut admin",
+        "• /listadmin — daftar admin",
+        "• /setprof <ACC_NO> — angkat Professor",
+        "• /unsetprof <ACC_NO> — cabut Professor",
+        "• /resetacc <ACC_NO> — hapus persona (nomor kembali ke pool)",
+        "• /setforward_public_here — set channel forward PUBLIC",
+        "• /setforward_stafftalk_here — set channel forward STAFF/TALK",
+        "• /where_forward — cek target forward",
+        "• /memberlist — daftar persona",
+        "",
+        "Title registry:",
+        "• /createtitle <nama>",
+        "• /listtitle",
+        "• /deltitle <ID>",
+        "• /granttitle <@user|uid|ACC_NO> <ID>",
+        "• /revoketitle <@user|uid|ACC_NO> <ID>",
+        "",
+        "Registration controls:",
+        "• /regopen <calon|pengurus|media|sponsor|event>",
+        "• /regclose <calon|pengurus|media|sponsor|event>",
+        "• /seteventform  (reply ke format multi-baris untuk menyetel)",
+        "• /previeweventform — lihat format event aktif",
+        "",
+        "Divine Bless moderation:",
+        "• /divinebless <approve|reject> (reply ke pengajuan)",
+    ]
+
+    lines = umum[:]
+    if is_admin:
+        lines += admin
+    await update.message.reply_text("\n".join(lines))
+
+# ---------- START BOT ----------
+def main():
+    load_state()
+    load_accounts()
+    load_bclass()
+    load_raport()
+    load_expedition()
+    load_titles()
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # === FIERTE TALK – prioritas paling awal ===
+    app.add_handler(CommandHandler("starttalk", start_talk_cmd), group=-1)
+    app.add_handler(CommandHandler("stoptalk", stop_talk_cmd), group=-1)
+    app.add_handler(
+        MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, talk_admin_reply_router),
+        group=-1
+    )
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, talk_user_router, block=False),
+        group=-1
+    )
+
+    # === Registration Conversation ===
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("registration", registration)],
+        states={
+            CHOOSING: [CallbackQueryHandler(registration_callback)],
+            TYPING:   [MessageHandler(filters.TEXT & ~filters.COMMAND, registration_submit)],
+            CONFIRM:  [CallbackQueryHandler(confirm_callback)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    app.add_handler(conv_handler, group=0)
+
+    # === Introduction ===
+    intro_conv = ConversationHandler(
+        entry_points=[CommandHandler("introduction", introduction)],
+        states={
+            INTRO_ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, intro_ask_name)],
+            INTRO_ASK_PILAR: [CallbackQueryHandler(intro_ask_pilar, pattern=r"^pillar:")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    app.add_handler(intro_conv, group=0)
+
+    # === Title toggle dari /changemyacc ===
+    app.add_handler(CallbackQueryHandler(title_set_cb, pattern=r"^ttlset:"), group=1)
+
+    # === Commands umum ===
+    app.add_handler(CommandHandler("menu", menu), group=0)
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"), group=0)
+    app.add_handler(CommandHandler("cancel", cancel), group=0)
+    app.add_handler(CommandHandler("where_forward", where_forward), group=0)
+
+    app.add_handler(CommandHandler("rollatr", rollatr), group=0)
+    app.add_handler(CommandHandler("resetatr", resetatr_cmd), group=0)
+    app.add_handler(CallbackQueryHandler(pickatr, pattern=r"^pick:"), group=0)
+    app.add_handler(CallbackQueryHandler(assign_attr, pattern=r"^attr:"), group=0)
+    app.add_handler(CallbackQueryHandler(usestat, pattern=r"^usestat:"), group=0)
+    app.add_handler(CommandHandler("mystat", mystat), group=0)
+    app.add_handler(CommandHandler("divine", divine), group=0)
+
+    # === Account & MyInfo (TAB) ===
+    app.add_handler(CommandHandler("myinfo", myinfo), group=0)
+    app.add_handler(CallbackQueryHandler(myinfo_cb, pattern=r"^myinfo:"), group=0)
+
+    # === Account change ===
+    app.add_handler(CommandHandler("changemyacc", changemyacc), group=1)
+    app.add_handler(CallbackQueryHandler(acc_change_callback, pattern=r"^accchg:"), group=1)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, account_edit_router), group=1)
+
+    # === IDC manual ===
+    app.add_handler(CommandHandler("setidc", setidc), group=0)
+    app.add_handler(CommandHandler("clearidc", clearidc), group=0)
+
+    # === Admin/Currathor tools ===
+    app.add_handler(CommandHandler("addadmin", add_admin), group=0)
+    app.add_handler(CommandHandler("deladmin", del_admin), group=0)
+    app.add_handler(CommandHandler("listadmin", list_admin), group=0)
+    app.add_handler(CommandHandler("setprof", setprof), group=0)
+    app.add_handler(CommandHandler("unsetprof", unsetprof), group=0)
+    app.add_handler(CommandHandler("resetacc", resetacc), group=0)
+    app.add_handler(CommandHandler("memberlist", memberlist), group=0)
+    app.add_handler(CommandHandler("setforward_public_here", setforward_public_here), group=0)
+    app.add_handler(CommandHandler("setforward_stafftalk_here", setforward_stafftalk_here), group=0)
+    # registration toggles + event form
+    app.add_handler(CommandHandler("regopen", regopen), group=0)
+    app.add_handler(CommandHandler("regclose", regclose), group=0)
+    app.add_handler(CommandHandler("seteventform", seteventform), group=0)
+    app.add_handler(CommandHandler("previeweventform", previeweventform), group=0)
+
+
+    # === Kelas ===
+    app.add_handler(CommandHandler("open", open_command), group=0)
+    app.add_handler(CommandHandler("close", close_command), group=0)
+    app.add_handler(CommandHandler("rekap", rekap_command), group=0)
+    app.add_handler(CallbackQueryHandler(bclass_attend_cb, pattern=r"^bclass:attend:"), group=0)
+
+    # === Expedition ===
+    app.add_handler(CommandHandler("expedition", expedition_cmd), group=0)
+    app.add_handler(CallbackQueryHandler(expedition_join_cb, pattern=r"^expedition:join$"), group=0)
+
+    # === Title registry ===
+    app.add_handler(CommandHandler("createtitle", title_create), group=0)
+    app.add_handler(CommandHandler("listtitle", title_list), group=0)
+    app.add_handler(CommandHandler("deltitle", title_delete), group=0)
+    app.add_handler(CommandHandler("granttitle", title_grant), group=0)
+    app.add_handler(CommandHandler("revoketitle", title_revoke), group=0)
+
+    # === Help ===
+    app.add_handler(CommandHandler("help", help_cmd), group=0)
+
+    # === Router teks bebas untuk menu ===
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_router, block=False),
+        group=5
+    )
+
+    # === Divine Bless handlers ===
+    app.add_handler(CommandHandler("addskill", addskill), group=0)
+    app.add_handler(CommandHandler("divinebless", divinebless), group=0)
+
+    print("🤖 Fierte is alive...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
